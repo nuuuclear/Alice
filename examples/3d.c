@@ -21,7 +21,7 @@ static Vec3 rotate_xyz(Vec3 v, float ax, float ay, float az);
 
 int main(int argc, char const *argv[]) {
     alice_config config = {
-        .title      = "Paint",
+        .title      = "3D",
         .width      = WIDTH,
         .height     = HEIGHT,
         .scale      = 2,
