@@ -1,0 +1,9 @@
+build/
+out/
+
+*.exe
+*.o
+*.elf
+
+.vscode/
+.vs/
