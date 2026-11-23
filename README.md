@@ -1,22 +1,31 @@
 # Alice
-Alice is a simple single-header library for all you graphical, input, and windowing needs.
+Alice is a simple single-header library providing OS abstraction and various utility
 
-Best for simple projects such as emulators, demos, or learning.
+Great for projects such as emulators, demos, or learning.
 
-## What it provides
+## Headers:
 
-- A Window
-- Cross-platform keyboard and mouse input
+#### alice.h
+- Basic window managment
+- Keyboard and mouse input
 - A software renderer with basic graphics API such as rect or line drawing
-- Portablility, provides an easily extendable backending system to port it to new platforms
 - Colour manipulation functions
+- Timing functions
+- Portable, provides an easily extendable backending system to port it to new platforms
 
-With optional:
-- Audio header with audio API and a waveform synth
-- Text header with a text renderer and format utilities
+#### alice_audio.h
+- Provides a software PCM audio buffer
+- Includes a basic waveform synthesizer
+
+#### alice_text.h
+- Text renderer
+- ASCII, UTF-8, and Shift-JIS
+- Formatting and converters between formats
+- Includes build-in 'Misaki Gothic' font (this can be disabled)
 
 ## Limitations
 - Limited macOS support, it currently wraps SDL2 (which defeats the purpose of this library, but provides portability if need be)
+- No emscriptem or WASM support (yet!)
 - No hardware rendering support
 
 ## License
