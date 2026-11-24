@@ -150,17 +150,17 @@ typedef struct alice_text_style {
 ALICE_TEXT_API void alice_text_style_init(alice_text_style *style);
 
 ALICE_TEXT_API int alice_draw_text(
-    alice_window *window, int x, int y, const char *text,
+    alice_surface *surface, int x, int y, const char *text,
     const alice_text_style *style
 );
 
 ALICE_TEXT_API int alice_draw_text_n(
-    alice_window *window, int x, int y, const char *text,
+    alice_surface *surface, int x, int y, const char *text,
     size_t length, const alice_text_style *style
 );
 
 ALICE_TEXT_API int alice_draw_text_utf32(
-    alice_window *window, int x, int y,
+    alice_surface *surface, int x, int y,
     const uint32_t *code_points, size_t count,
     const alice_text_style *style
 );
@@ -902,26 +902,8 @@ void alice_text_style_init(alice_text_style *style) {
     style->tab_width = 4;
 }
 
-static void alice_text_fill(alice_framebuffer *fb, int x, int y, int w, int h, uint32_t color) {
-    int x1, y1, yy, xx;
-
-    if (w <= 0 || h <= 0)
-        return;
-    x1 = x + w > fb->width  ? fb->width  : x + w;
-    y1 = y + h > fb->height ? fb->height : y + h;
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-
-    for (yy = y; yy < y1; ++yy) {
-        uint32_t *row = (uint32_t *)((char *)fb->pixels + (size_t)yy * (size_t)fb->pitch);
-        for (xx = x; xx < x1; ++xx) {
-            row[xx] = color;
-        }
-    }
-}
-
 static void alice_text_blit(
-    alice_framebuffer *fb, const alice_glyph *g, int x, int y,
+    alice_surface *surface, const alice_glyph *g, int x, int y,
     int scale, uint32_t color
 ) {
     int row, col;
@@ -930,7 +912,7 @@ static void alice_text_blit(
         const uint8_t *bits = g->bits + (size_t)row * (size_t)g->stride;
         int py = y + row * scale;
 
-        if (py >= fb->height || py + scale <= 0)
+        if (py >= surface->height || py + scale <= 0)
             continue;
 
         col = 0;
@@ -945,28 +927,42 @@ static void alice_text_blit(
             while (col < g->width && (bits[col >> 3] & (0x80u >> (col & 7)))) {
                 ++col;
             }
-            alice_text_fill(fb, x + start * scale, py, (col - start) * scale, scale, color);
+            alice_draw_rect(surface, x + start * scale, py, (col - start) * scale, scale, color);
         }
     }
 }
 
+#define ALICE_TEXT_LIMIT        0x40000000
+#define ALICE_TEXT_MAX_STYLE    0x1000000
+
+static int alice_text_clamp(int64_t value) {
+    return value > ALICE_TEXT_LIMIT ? ALICE_TEXT_LIMIT : value < -ALICE_TEXT_LIMIT ? -ALICE_TEXT_LIMIT : (int)value;
+}
+
+static int alice_text_clamp_style(int value) {
+    return value > ALICE_TEXT_MAX_STYLE ? ALICE_TEXT_MAX_STYLE : value < -ALICE_TEXT_MAX_STYLE ? -ALICE_TEXT_MAX_STYLE : value;
+}
+
 static int alice_text_run(
-    alice_window *window, const alice_text_style *style_in,
+    alice_surface *surface, const alice_text_style *style_in,
     int x, int y, alice_iter *it, int *out_w, int *out_h
 ) {
-    alice_framebuffer *fb = window ? alice_get_framebuffer(window) : NULL;
+    alice_surface *target = surface && surface->pixels ? surface : NULL;
     alice_text_style style;
     const alice_font *font;
     alice_glyph g;
     uint32_t cp;
 
     int scale;
+    int spacing;
+    int line_spacing;
     int line_h;
     int space_adv;
     int tab_w;
-    int pen_x = x, pen_y = y;
-    int max_w = 0;
-    int lines = 1;
+    int left = alice_text_clamp(x);
+    int pen_x = left, pen_y = alice_text_clamp(y);
+    int64_t max_w = 0;
+    int64_t lines = 1;
 
     if (style_in) {
         style = *style_in;
@@ -977,35 +973,43 @@ static int alice_text_run(
 #ifndef ALICE_TEXT_NO_BUILTIN_FONT
     if (!font) font = alice_font_builtin();
 #endif
-    scale = style.scale > 0 ? style.scale : 1;
+    scale = style.scale > 0 ? alice_text_clamp_style(style.scale) : 1;
+    spacing = alice_text_clamp_style(style.spacing);
+    line_spacing = alice_text_clamp_style(style.line_spacing);
     if (out_w) *out_w = 0;
     if (out_h) *out_h = 0;
     if (!font) return x;
 
-    line_h = font->height * scale;
+    line_h = alice_text_clamp((int64_t)font->height * scale);
     space_adv = alice_font_glyph(font, ' ', &g) ? g.advance : font->height / 2;
-    tab_w = (style.tab_width > 0 ? style.tab_width : 4) * (space_adv * scale + style.spacing);
+    {
+        int64_t tabs = style.tab_width > 0 ? style.tab_width : 4;
+        if (tabs > 0x100000)
+            tabs = 0x100000;
+        tab_w = alice_text_clamp(tabs * ((int64_t)space_adv * scale + spacing));
+    }
     if (tab_w <= 0) tab_w = 1;
 
     while (alice_iter_next(it, &cp)) {
         int adv;
+        int64_t step;
         bool have;
 
         if (cp == '\n') {
-            if (pen_x - x - style.spacing > max_w)
-                max_w = pen_x - x - style.spacing;
-            pen_x = x;
-            pen_y += line_h + style.line_spacing;
+            if ((int64_t)pen_x - left - spacing > max_w)
+                max_w = (int64_t)pen_x - left - spacing;
+            pen_x = left;
+            pen_y = alice_text_clamp((int64_t)pen_y + line_h + line_spacing);
             ++lines;
 
             continue;
         }
         if (cp == '\t') {
-            int rel = pen_x - x, next = (rel / tab_w + 1) * tab_w;
-            if (fb && style.draw_background) {
-                alice_text_fill(fb, pen_x, pen_y, next - rel, line_h, style.background);
+            int64_t rel = (int64_t)pen_x - left, next = (rel / tab_w + 1) * tab_w;
+            if (target && style.draw_background) {
+                alice_draw_rect(target, pen_x, pen_y, alice_text_clamp(next - rel), line_h, style.background);
             }
-            pen_x = x + next;
+            pen_x = alice_text_clamp(left + next);
 
             continue;
         }
@@ -1017,21 +1021,22 @@ static int alice_text_run(
             have = alice_font_glyph(font, font->fallback, &g);
         }
         adv = have ? g.advance : space_adv;
+        step = (int64_t)adv * scale + spacing;
 
-        if (fb) {
+        if (target) {
             if (style.draw_background)
-                alice_text_fill(fb, pen_x, pen_y, adv * scale + style.spacing, line_h, style.background);
+                alice_draw_rect(target, pen_x, pen_y, alice_text_clamp(step), line_h, style.background);
             if (have)
-                alice_text_blit(fb, &g, pen_x, pen_y, scale, style.color);
+                alice_text_blit(target, &g, pen_x, pen_y, scale, style.color);
         }
-        pen_x += adv * scale + style.spacing;
+        pen_x = alice_text_clamp(pen_x + step);
     }
 
-    if (pen_x - x - style.spacing > max_w) {
-        max_w = pen_x - x - style.spacing;
+    if ((int64_t)pen_x - left - spacing > max_w) {
+        max_w = (int64_t)pen_x - left - spacing;
     }
-    if (out_w) *out_w = max_w > 0 ? max_w : 0;
-    if (out_h) *out_h = lines * line_h + (lines - 1) * style.line_spacing;
+    if (out_w) *out_w = alice_text_clamp(max_w > 0 ? max_w : 0);
+    if (out_h) *out_h = alice_text_clamp(lines * line_h + (lines - 1) * line_spacing);
     return pen_x;
 }
 
@@ -1040,32 +1045,32 @@ static alice_encoding alice_text_encoding(const alice_text_style *style) {
 }
 
 int alice_draw_text_n(
-    alice_window *window, int x, int y, const char *text, size_t length,
+    alice_surface *surface, int x, int y, const char *text, size_t length,
     const alice_text_style *style
 ) {
     alice_iter it;
-    if (!window || !alice_get_framebuffer(window))
+    if (!surface || !surface->pixels)
         return x;
     alice_iter_bytes(&it, alice_text_encoding(style), text, length);
-    return alice_text_run(window, style, x, y, &it, NULL, NULL);
+    return alice_text_run(surface, style, x, y, &it, NULL, NULL);
 }
 
 int alice_draw_text(
-    alice_window *window, int x, int y, const char *text,
+    alice_surface *surface, int x, int y, const char *text,
     const alice_text_style *style
 ) {
-    return alice_draw_text_n(window, x, y, text, ALICE_TEXT_NULL_TERMINATED, style);
+    return alice_draw_text_n(surface, x, y, text, ALICE_TEXT_NULL_TERMINATED, style);
 }
 
 int alice_draw_text_utf32(
-    alice_window *window, int x, int y, const uint32_t *cps, size_t count,
+    alice_surface *surface, int x, int y, const uint32_t *cps, size_t count,
     const alice_text_style *style
 ) {
     alice_iter it;
-    if (!window || !alice_get_framebuffer(window))
+    if (!surface || !surface->pixels)
         return x;
     alice_iter_u32(&it, cps, count);
-    return alice_text_run(window, style, x, y, &it, NULL, NULL);
+    return alice_text_run(surface, style, x, y, &it, NULL, NULL);
 }
 
 void alice_measure_text_n(

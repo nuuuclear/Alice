@@ -19,7 +19,7 @@ Backends (automatically selected for you):
     headless
         #define ALICE_NO_BACKEND
 
-        Has no window, you can still render to the framebuffer and inject inputs
+        Has no window, you can still draw on surfaces and inject inputs
         Usefull for testing. also this is good for implementing custom backends
 
 Optional macros (before the implementation include):
@@ -79,12 +79,15 @@ typedef struct alice_config {
                             // (uneven pixel widths) instead of integer scaling
 } alice_config;
 
-typedef struct alice_framebuffer {
+typedef struct alice_surface {
     uint32_t *pixels;       // 0x00RRGGBB, row[y] major, starts in top row
     int width;
     int height;
     int pitch;              // bytes per row
-} alice_framebuffer;
+    bool window_owned;
+} alice_surface;
+
+typedef alice_surface alice_framebuffer;
 
 enum {
     ALICE_KEY_UNKNOWN = 0,
@@ -182,29 +185,53 @@ ALICE_API bool alice_key_down(const alice_window *window, int key);
 ALICE_API bool alice_mouse_down(const alice_window *window, int button);
 ALICE_API void alice_get_mouse(const alice_window *window, int *x, int *y);
 
+//// surface
+
+ALICE_API alice_surface *alice_get_surface(alice_window *window);
+ALICE_API alice_surface *alice_surface_create(int width, int height);
+ALICE_API alice_surface *alice_surface_clone(const alice_surface *surface);
+ALICE_API void alice_surface_destroy(alice_surface *surface);
+
 //// rendering
 
 ALICE_API alice_framebuffer *alice_get_framebuffer(alice_window *window);
 ALICE_API void alice_present(alice_window *window);
 
-ALICE_API void alice_clear(alice_window *window, uint32_t color);
-ALICE_API void alice_draw_point(alice_window *window, int x, int y, uint32_t color);
-ALICE_API void alice_draw_line(alice_window *window, int start_x, int start_y, int end_x, int end_y, uint32_t color);
-ALICE_API void alice_draw_rect(alice_window *window, int x, int y, int width, int height, uint32_t color);
+ALICE_API void alice_clear(alice_surface *surface, uint32_t color);
+ALICE_API void alice_draw_point(alice_surface *surface, int x, int y, uint32_t color);
+ALICE_API void alice_draw_line_thick(alice_surface *surface, int start_x, int start_y, int end_x, int end_y, int thickness, uint32_t color);
+ALICE_API void alice_draw_line(alice_surface *surface, int start_x, int start_y, int end_x, int end_y, uint32_t color);
 
-ALICE_API void alice_draw_rect_outline(alice_window *window, int x, int y, int width, int height, uint32_t color);
-ALICE_API void alice_draw_circle(alice_window *window, int center_x, int center_y, int radius, uint32_t color);
-ALICE_API void alice_draw_circle_outline(alice_window *window, int center_x, int center_y, int radius, uint32_t color);
+ALICE_API void alice_draw_rect(alice_surface *surface, int x, int y, int width, int height, uint32_t color);
 
-// gets the argb value of the pixel at (x, y). this will return 0x00000000 outside of the framebuffer
-ALICE_API uint32_t alice_get_pixel(const alice_window *window, int x, int y);
+ALICE_API void alice_draw_rect_outline(alice_surface *surface, int x, int y, int width, int height, uint32_t color);
+ALICE_API void alice_draw_circle(alice_surface *surface, int center_x, int center_y, int radius, uint32_t color);
+ALICE_API void alice_draw_circle_outline(alice_surface *surface, int center_x, int center_y, int radius, uint32_t color);
+
+// gets the argb value of the pixel at (x, y). this will return 0x00000000 outside of the surface
+ALICE_API uint32_t alice_get_pixel(const alice_surface *surface, int x, int y);
 
 // copy an area of pixels onto the framebuffer
-ALICE_API void alice_blit(alice_window *window, int x, int y, const uint32_t *pixels, int width, int height, int pitch);
-ALICE_API void alice_blit_keyed(alice_window *window, int x, int y, const uint32_t *pixels, int width, int height, int pitch, uint32_t key);
+ALICE_API void alice_blit(alice_surface *surface, int x, int y, const uint32_t *pixels, int width, int height, int pitch);
+ALICE_API void alice_blit_keyed(alice_surface *surface, int x, int y, const uint32_t *pixels, int width, int height, int pitch, uint32_t key);
+
+
+ALICE_API void alice_draw_surface(alice_surface *target, int x, int y, const alice_surface *source);
+
+ALICE_API void alice_draw_surface_part(
+    alice_surface *target, int x, int y,
+    const alice_surface *source, int source_x, int source_y, int width, int height
+);
+
+ALICE_API void alice_draw_surface_keyed(alice_surface *target, int x, int y, const alice_surface *source, uint32_t key);
+
+ALICE_API void alice_draw_surface_stretched(
+    alice_surface *target, int x, int y, int width, int height,
+    const alice_surface *source, int source_x, int source_y, int source_width, int source_height
+);
 
 // save the framebuffer as BMP a file, returns false upon failure
-ALICE_API bool alice_save_bmp(const alice_window *window, const char *path);
+ALICE_API bool alice_save_bmp(const alice_surface *surface, const char *path);
 
 //// colour
 
@@ -276,6 +303,7 @@ ALICE_API double alice_frame_wait(alice_frame_timer *timer, double fps);
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <limits.h>
 
 #if !defined(_WIN32) && !defined(CLOCK_MONOTONIC)
     #error "alice.h needs POSIX timers: \
@@ -363,14 +391,11 @@ ALICE_API double alice_frame_wait(alice_frame_timer *timer, double fps);
 #define ALICE_MAX_WINDOW_SIDE  32767
 
 struct alice_window {
-    int             width, height;
     int             scale;
     bool            resizable;
     bool            stretch;
 
-    uint32_t       *pixels;
-    alice_framebuffer
-                    framebuffer;
+    alice_surface   surface;
 
     int             client_width;
     int             client_height;
@@ -570,8 +595,8 @@ bool alice_poll_event(alice_window *window, alice_event *event) {
 }
 
 static void alice_update_viewport(alice_window *window) {
-    int kx = window->client_width  / window->width;
-    int ky = window->client_height / window->height;
+    int kx = window->client_width  / window->surface.width;
+    int ky = window->client_height / window->surface.height;
     int scale_factor  = kx < ky ? kx : ky;
 
     if (window->stretch || scale_factor < 1) {
@@ -580,8 +605,8 @@ static void alice_update_viewport(alice_window *window) {
         window->view_w = window->client_width;
         window->view_h = window->client_height;
     } else {
-        window->view_w = window->width  * scale_factor;
-        window->view_h = window->height * scale_factor;
+        window->view_w = window->surface.width  * scale_factor;
+        window->view_h = window->surface.height * scale_factor;
         window->view_x = (window->client_width  - window->view_w) / 2;
         window->view_y = (window->client_height - window->view_h) / 2;
     }
@@ -602,19 +627,19 @@ static ALICE_UNUSED int alice_to_framebuffer(int value, int framebuffer_size, in
 }
 
 static ALICE_UNUSED int alice_map_x(const alice_window *window, int pixel_x) {
-    return alice_to_framebuffer(pixel_x - window->view_x, window->width, window->view_w);
+    return alice_to_framebuffer(pixel_x - window->view_x, window->surface.width, window->view_w);
 }
 
 static ALICE_UNUSED int alice_map_y(const alice_window *window, int pixel_y) {
-    return alice_to_framebuffer(pixel_y - window->view_y, window->height, window->view_h);
+    return alice_to_framebuffer(pixel_y - window->view_y, window->surface.height, window->view_h);
 }
 
 static ALICE_UNUSED void alice_fill_scaled(
     const alice_window *window, void *image, size_t pitch,
     int image_width, int image_height, const int *column_map
 ) {
-    int fwidth  = window->width;
-    int fheight = window->height;
+    int fwidth  = window->surface.width;
+    int fheight = window->surface.height;
 
     int scale_factor = (
         image_width % fwidth == 0
@@ -627,7 +652,7 @@ static ALICE_UNUSED void alice_fill_scaled(
 
     for (y = 0; y < image_height; ++y) {
         int source_y = alice_to_framebuffer(y, fheight, image_height);
-        const uint32_t *source_pixels = window->pixels + (size_t)source_y * (size_t)fwidth;
+        const uint32_t *source_pixels = window->surface.pixels + (size_t)source_y * (size_t)fwidth;
         uint32_t *destination_pixels = (uint32_t *)((char *)image + (size_t)y * pitch);
         int x;
 
@@ -880,7 +905,7 @@ static bool alice_win_sync_dib(alice_window *window) {
     window->dib_height = window->view_h;
     window->column_map = columns;
     for (x = 0; x < window->view_w; ++x) {
-        columns[x] = alice_to_framebuffer(x, window->width, window->view_w);
+        columns[x] = alice_to_framebuffer(x, window->surface.width, window->view_w);
     }
     
     window->borders_dirty = true;
@@ -1583,7 +1608,7 @@ static bool alice_x_resize_image(alice_window *window, int width, int height) {
     if (shared) image->obdata = (char *)&window->shm;
 #endif
     for (x = 0; x < width; ++x) {
-        columns[x] = alice_to_framebuffer(x, window->width, width);
+        columns[x] = alice_to_framebuffer(x, window->surface.width, width);
     }
 
     return true;
@@ -1637,8 +1662,8 @@ static void alice_x_fill_slow(alice_window *window) {
 
     int y;
     for (y = 0; y < window->image_height; ++y) {
-        int source_y = alice_to_framebuffer(y, window->height, window->image_height);
-        const uint32_t *source_pixels = window->pixels + (size_t)source_y * (size_t)window->width;
+        int source_y = alice_to_framebuffer(y, window->surface.height, window->image_height);
+        const uint32_t *source_pixels = window->surface.pixels + (size_t)source_y * (size_t)window->surface.width;
 
         int x;
         for (x = 0; x < window->image_width; ++x) {
@@ -1673,10 +1698,10 @@ static void alice_x_present(alice_window *window) {
     if (!window->fast_format) {
         alice_x_fill_slow(window);
     } else if (!alice_x_uses_shm(window)
-           &&  window->image_width == window->width && window->image_height == window->height
-           &&  img->bytes_per_line == window->framebuffer.pitch
+           &&  window->image_width == window->surface.width && window->image_height == window->surface.height
+           &&  img->bytes_per_line == window->surface.pitch
     ) {
-        img->data = (char *)window->pixels;
+        img->data = (char *)window->surface.pixels;
         direct = true;
     } else {
         alice_x_fill_fast(window);
@@ -1982,7 +2007,7 @@ static bool alice_backend_create(alice_window *window, const alice_config *confi
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
     window->texture = SDL_CreateTexture(
         window->renderer, SDL_PIXELFORMAT_ARGB8888,
-        SDL_TEXTUREACCESS_STREAMING, window->width, window->height
+        SDL_TEXTUREACCESS_STREAMING, window->surface.width, window->surface.height
     );
     if (!window->texture) return false;
 
@@ -1996,7 +2021,7 @@ static bool alice_backend_create(alice_window *window, const alice_config *confi
 static void alice_backend_present(alice_window *window) {
     if (!window->texture)
         return;
-    SDL_UpdateTexture(window->texture, NULL, window->pixels, window->framebuffer.pitch);
+    SDL_UpdateTexture(window->texture, NULL, window->surface.pixels, window->surface.pitch);
     SDL_RenderClear(window->renderer);
     {
         SDL_Rect destination_pixels;
@@ -2082,6 +2107,20 @@ static void alice_backend_pump(alice_window *window) {
 //   Window   //////////////////////////////////////
 ////////////////////////////////////////////
 
+static bool alice_surface_setup(alice_surface *surface, int width, int height) {
+    memset(surface, 0, sizeof(*surface));
+    if (width <= 0 || height <= 0 || width > ALICE_MAX_WINDOW_SIDE || height > ALICE_MAX_WINDOW_SIDE)
+        return false;
+
+    surface->pixels = (uint32_t *)ALICE_CALLOC((size_t)width * (size_t)height, sizeof(uint32_t));
+    if (!surface->pixels)
+        return false;
+    surface->width  = width;
+    surface->height = height;
+    surface->pitch  = width * (int)sizeof(uint32_t);
+    return true;
+}
+
 alice_window *alice_create(const alice_config *config) {
     alice_window *window;
     int scale;
@@ -2098,28 +2137,22 @@ alice_window *alice_create(const alice_config *config) {
 
     window = (alice_window *)ALICE_CALLOC(1, sizeof(*window));
     if (!window) return NULL;
-    window->width         = config->width;
-    window->height        = config->height;
     window->scale         = scale;
     window->resizable     = config->resizable;
     window->client_width  = config->width * scale;
     window->client_height = config->height * scale;
     window->stretch       = config->stretch;
-    alice_update_viewport(window);
 
-    window->pixels = (uint32_t *)ALICE_CALLOC((size_t)window->width * (size_t)window->height, sizeof(uint32_t));
-    if (!window->pixels) {
+    if (!alice_surface_setup(&window->surface, config->width, config->height)) {
         ALICE_FREE(window);
         return NULL;
     }
-    window->framebuffer.pixels = window->pixels;
-    window->framebuffer.width  = window->width;
-    window->framebuffer.height = window->height;
-    window->framebuffer.pitch  = window->width * (int)sizeof(uint32_t);
+    window->surface.window_owned = true;
+    alice_update_viewport(window);
 
     if (!alice_backend_create(window, config)) {
         alice_backend_destroy(window);
-        ALICE_FREE(window->pixels);
+        ALICE_FREE(window->surface.pixels);
         ALICE_FREE(window);
         return NULL;
     }
@@ -2133,7 +2166,7 @@ void alice_destroy(alice_window *window) {
         alice_event_free_path(&window->events[(window->event_head + index) % ALICE_EVENT_QUEUE_SIZE]);
     ALICE_FREE(window->drop_path);
     alice_backend_destroy(window);
-    ALICE_FREE(window->pixels);
+    ALICE_FREE(window->surface.pixels);
     ALICE_FREE(window);
 }
 
@@ -2168,8 +2201,41 @@ void alice_get_mouse(const alice_window *window, int *x, int *y) {
     if (y) *y = window->mouse_y;
 }
 
+alice_surface *alice_get_surface(alice_window *window) {
+    return window ? &window->surface : NULL;
+}
+
 alice_framebuffer *alice_get_framebuffer(alice_window *window) {
-    return window ? &window->framebuffer : NULL;
+    return alice_get_surface(window);
+}
+
+alice_surface *alice_surface_create(int width, int height) {
+    alice_surface *surface = (alice_surface *)ALICE_CALLOC(1, sizeof(*surface));
+    if (!surface)
+        return NULL;
+    if (!alice_surface_setup(surface, width, height)) {
+        ALICE_FREE(surface);
+        return NULL;
+    }
+    return surface;
+}
+
+alice_surface *alice_surface_clone(const alice_surface *surface) {
+    alice_surface *copy;
+
+    if (!surface || !surface->pixels)
+        return NULL;
+    copy = alice_surface_create(surface->width, surface->height);
+    if (copy)
+        memcpy(copy->pixels, surface->pixels, (size_t)surface->width * (size_t)surface->height * sizeof(uint32_t));
+    return copy;
+}
+
+void alice_surface_destroy(alice_surface *surface) {
+    if (!surface || surface->window_owned)
+        return;
+    ALICE_FREE(surface->pixels);
+    ALICE_FREE(surface);
 }
 
 ////////////////////////////////////////////////////////////
@@ -2177,34 +2243,34 @@ alice_framebuffer *alice_get_framebuffer(alice_window *window) {
 ////////////////////////////////////////////
 
 // clear the screen
-void alice_clear(alice_window *window, uint32_t color) {
-    if (!window || !window->pixels) return;
+void alice_clear(alice_surface *surface, uint32_t color) {
+    if (!surface || !surface->pixels) return;
     
     size_t index, count;
-    count = (size_t)window->width * (size_t)window->height;
+    count = (size_t)surface->width * (size_t)surface->height;
     for (index = 0; index < count; ++index) {
-        window->pixels[index] = color;
+        surface->pixels[index] = color;
     }
 }
 
-// draw a point (a pixel) to the screen
-void alice_draw_point(alice_window *window, int x, int y, uint32_t color) {
-    if (!window
-    ||  !window->pixels
+// draw a point (a pixel) onto the surface
+void alice_draw_point(alice_surface *surface, int x, int y, uint32_t color) {
+    if (!surface
+    ||  !surface->pixels
     ||  x < 0
     ||  y < 0
-    ||  x >= window->width
-    ||  y >= window->height
+    ||  x >= surface->width
+    ||  y >= surface->height
     ) return;
     
-    window->pixels[(size_t)y * (size_t)window->width + (size_t)x] = color;
+    surface->pixels[(size_t)y * (size_t)surface->width + (size_t)x] = color;
 }
 
 // Cohen-Sutherland outcode
-// returns which side(s) of the framebuffer the point is on
-static int alice_region(const alice_window *window, int x, int y) {
-    return  (x < 0 ? 1 : 0) | (x >= window->width  ? 2 : 0)
-        |   (y < 0 ? 4 : 0) | (y >= window->height ? 8 : 0);
+// returns which side(s) of the surface the point is on
+static int alice_region(const alice_surface *surface, int x, int y) {
+    return  (x < 0 ? 1 : 0) | (x >= surface->width  ? 2 : 0)
+        |   (y < 0 ? 4 : 0) | (y >= surface->height ? 8 : 0);
 }
 
 static void alice_line_steps(uint64_t scale_factor, uint64_t array, uint64_t button, uint64_t *xs, uint64_t *ys) {
@@ -2223,7 +2289,7 @@ static void alice_line_steps(uint64_t scale_factor, uint64_t array, uint64_t but
 }
 
 static bool alice_line_before(
-    const alice_window *window, int start_x, int start_y, int source_x, int source_y,
+    const alice_surface *surface, int start_x, int start_y, int source_x, int source_y,
     uint64_t scale_factor, uint64_t array, uint64_t button
 ) {
     uint64_t xs, ys;
@@ -2232,146 +2298,175 @@ static bool alice_line_before(
     alice_line_steps(scale_factor, array, button, &xs, &ys);
     x = (int64_t)start_x + source_x * (int64_t)xs;
     y = (int64_t)start_y + source_y * (int64_t)ys;
-    
-    return (source_x > 0 ? x < 0 : x >= window->width)
-        || (source_y > 0 ? y < 0 : y >= window->height);
+    return (source_x > 0 ? x < 0 : x >= surface->width)
+        || (source_y > 0 ? y < 0 : y >= surface->height);
 }
 
-void alice_draw_line(alice_window *window, int start_x, int start_y, int end_x, int end_y, uint32_t color) {
-    int64_t delta_x, delta_y, error_code;
-    uint64_t array, button, value_count, low_value, high_value, scale_factor, xs, ys, event;
-    int64_t x, y;
-    int source_x, source_y;
+static void alice_draw_line_internal(
+    alice_surface *surface,
+    int start_x, int start_y,
+    int end_x, int end_y,
+    int thickness,
+    uint32_t color,
+    int thick
+) {
+	int64_t delta_x, delta_y, error_code;
+	uint64_t array, button, value_count, low_value, high_value, scale_factor, xs, ys, event;
+	int64_t x, y;
+	int source_x, source_y;
 
-    if (!window || !window->pixels)
-        return;
+	if (!surface || !surface->pixels)
+		return;
 
-    if (start_x == end_x
-    &&  start_y == end_y
-    ) {
-        alice_draw_point(window, start_x, start_y, color);
-        return;
-    }
+	if (start_x == end_x && start_y == end_y) {
+		if (thick)
+			alice_draw_circle(surface, start_x, start_y, thickness, color);
+		else
+			alice_draw_point(surface, start_x, start_y, color);
+		return;
+	}
+
+	if (alice_region(surface, start_x, start_y) & alice_region(surface, end_x, end_y))
+		return;
+
+	delta_x = end_x > start_x ? (int64_t)end_x - start_x : (int64_t)start_x - end_x;
+	delta_y = end_y > start_y ? -((int64_t)end_y - start_y) : -((int64_t)start_y - end_y);
+	source_x = start_x < end_x ? 1 : -1;
+	source_y = start_y < end_y ? 1 : -1;
+
+	array = (uint64_t)delta_x;
+	button = (uint64_t)-delta_y;
+	value_count = array >= button ? array : button;
+
+	low_value = 0;
+	high_value = value_count + 1;
     
-    if (alice_region(window, start_x, start_y) & alice_region(window, end_x, end_y))
-        return;
+	while (low_value < high_value) {
+		uint64_t mid = low_value + (high_value - low_value) / 2;
 
-    delta_x = end_x > start_x ?  (int64_t)end_x - start_x   :   (int64_t)start_x - end_x;
-    delta_y = end_y > start_y ? -((int64_t)end_y - start_y) : -((int64_t)start_y - end_y);
-    source_x = start_x < end_x ? 1 : -1;
-    source_y = start_y < end_y ? 1 : -1;
+		if (alice_line_before(surface, start_x, start_y, source_x, source_y, mid, array, button))
+			low_value = mid + 1;
+		else
+			high_value = mid;
+	}
 
-    array = (uint64_t)delta_x;
-    button = (uint64_t)-delta_y;
-    value_count = array >= button ? array : button;
+	if (low_value > value_count)
+		return;
 
-    low_value = 0;
-    high_value = value_count + 1;
-    while (low_value < high_value) {
-        uint64_t mid = low_value + (high_value - low_value) / 2;
-        if (alice_line_before(window, start_x, start_y, source_x, source_y, mid, array, button))
-            low_value = mid + 1;
-        else
-            high_value = mid;
-    }
+	scale_factor = low_value;
 
-    if (low_value > value_count)
-        return;
+	alice_line_steps(scale_factor, array, button, &xs, &ys);
+	x = (int64_t)start_x + source_x * (int64_t)xs;
+	y = (int64_t)start_y + source_y * (int64_t)ys;
+	event = array - button - xs * button + ys * array;
+	error_code = event <= (uint64_t)INT64_MAX ? (int64_t)event : -(int64_t)(~event) - 1;
 
-    scale_factor = low_value;
+	for (;; ++scale_factor) {
+		int64_t e2;
 
-    alice_line_steps(scale_factor, array, button, &xs, &ys);
-    x = (int64_t)start_x + source_x * (int64_t)xs;
-    y = (int64_t)start_y + source_y * (int64_t)ys;
-    event = array - button - xs * button + ys * array;
-    error_code = event <= (uint64_t)INT64_MAX ? (int64_t)event : -(int64_t)(~event) - 1;
+		if (x < 0 || y < 0 || x >= surface->width || y >= surface->height)
+			break;
 
-    for (;; ++scale_factor) {
-        int64_t e2;
+		if (thick)
+			alice_draw_circle(surface, x, y, thickness, color);
+		else
+			surface->pixels[(size_t)y * (size_t)surface->width + (size_t)x] = color;
 
-        if (x < 0 || y < 0 || x >= window->width || y >= window->height)
-            break;
-        window->pixels[(size_t)y * (size_t)window->width + (size_t)x] = color;
-        if (scale_factor == value_count)
-            break;
+		if (scale_factor == value_count)
+			break;
 
-        e2 = 2 * error_code;
-        if (e2 >= delta_y) {
-            error_code += delta_y;
-            x += source_x;
-        }
-        
-        if (e2 <= delta_x) {
-            error_code += delta_x;
-            y += source_y;
-        }
-    }
+		e2 = 2 * error_code;
+		if (e2 >= delta_y) {
+			error_code += delta_y;
+			x += source_x;
+		}
+
+		if (e2 <= delta_x) {
+			error_code += delta_x;
+			y += source_y;
+		}
+	}
 }
 
-void alice_draw_rect(alice_window *window, int x, int y, int width, int height, uint32_t color) {
+void alice_draw_line(
+    alice_surface *surface,
+    int start_x, int start_y,
+    int end_x, int end_y,
+    uint32_t color
+) {
+	alice_draw_line_internal(surface, start_x, start_y, end_x, end_y, 0, color, false);
+}
+
+void alice_draw_line_thick(
+    alice_surface *surface,
+    int start_x, int start_y,
+    int end_x, int end_y,
+    int thickness,
+    uint32_t color
+) {
+	alice_draw_line_internal(surface, start_x, start_y, end_x, end_y, thickness, color, true);
+}
+
+void alice_draw_rect(alice_surface *surface, int x, int y, int width, int height, uint32_t color) {
     int64_t start_x, start_y, end_x, end_y, pixel_x, pixel_y;
 
-    if (!window
-    ||  !window->pixels
-    ||  width <= 0
-    ||  height <= 0
-    ) return;
+    if (!surface || !surface->pixels || width <= 0 || height <= 0)
+        return;
 
     start_x = x < 0 ? 0 : x;
     start_y = y < 0 ? 0 : y;
     end_x = (int64_t)x + width;
     end_y = (int64_t)y + height;
-
-    if (end_x > window->width)
-        end_x = window->width;
-    if (end_y > window->height)
-        end_y = window->height;
+    if (end_x > surface->width)
+        end_x = surface->width;
+    if (end_y > surface->height)
+        end_y = surface->height;
 
     for (pixel_y = start_y; pixel_y < end_y; ++pixel_y) {
         for (pixel_x = start_x; pixel_x < end_x; ++pixel_x) {
-            window->pixels[
+            surface->pixels[
                 (size_t)pixel_y 
-                * (size_t)window->width
+                * (size_t)surface->width
                 + (size_t)pixel_x
             ] = color;
         }
     }
 }
 
-uint32_t alice_get_pixel(const alice_window *window, int x, int y) {
-    if (!window
-    ||  !window->pixels
+uint32_t alice_get_pixel(const alice_surface *surface, int x, int y) {
+    if (!surface
+    ||  !surface->pixels
     ||  x < 0
     ||  y < 0
-    ||  x >= window->width
-    ||  y >= window->height
+    ||  x >= surface->width
+    ||  y >= surface->height
     ) return 0;
 
-    return window->pixels[(size_t)y * (size_t)window->width + (size_t)x];
+    return surface->pixels[(size_t)y * (size_t)surface->width + (size_t)x];
 }
 
 // a horizontal run of pixels
-static void alice_span(alice_window *window, int64_t start_x, int64_t end_x, int64_t y, uint32_t color) {
+static void alice_span(alice_surface *surface, int64_t start_x, int64_t end_x, int64_t y, uint32_t color) {
     uint32_t *row;
 
-    if (y < 0 || y >= window->height)
+    if (y < 0 || y >= surface->height)
         return;
     if (start_x < 0)
         start_x = 0;
-    if (end_x >= window->width)
-        end_x = (int64_t)window->width - 1;
+    if (end_x >= surface->width)
+        end_x = (int64_t)surface->width - 1;
     if (start_x > end_x)
         return;
 
-    row = window->pixels + (size_t)y * (size_t)window->width;
+    row = surface->pixels + (size_t)y * (size_t)surface->width;
     for (; start_x <= end_x; ++start_x)
         row[start_x] = color;
 }
 
-void alice_draw_rect_outline(alice_window *window, int x, int y, int width, int height, uint32_t color) {
+void alice_draw_rect_outline(alice_surface *surface, int x, int y, int width, int height, uint32_t color) {
     int64_t left, right, top, bottom, row, first, last;
 
-    if (!window || !window->pixels || width <= 0 || height <= 0)
+    if (!surface || !surface->pixels || width <= 0 || height <= 0)
         return;
 
     left   = x;
@@ -2379,14 +2474,14 @@ void alice_draw_rect_outline(alice_window *window, int x, int y, int width, int 
     top    = y;
     bottom = (int64_t)y + height - 1;
 
-    alice_span(window, left, right, top, color);
-    alice_span(window, left, right, bottom, color);
+    alice_span(surface, left, right, top, color);
+    alice_span(surface, left, right, bottom, color);
 
     first = top + 1 < 0 ? 0 : top + 1;
-    last  = bottom - 1 >= window->height ? (int64_t)window->height - 1 : bottom - 1;
+    last  = bottom - 1 >= surface->height ? (int64_t)surface->height - 1 : bottom - 1;
     for (row = first; row <= last; ++row) {
-        alice_span(window, left, left, row, color);
-        alice_span(window, right, right, row, color);
+        alice_span(surface, left, left, row, color);
+        alice_span(surface, right, right, row, color);
     }
 }
 
@@ -2415,37 +2510,37 @@ static int64_t alice_circle_reach(int64_t radius, int64_t dy) {
     return (int64_t)alice_isqrt((uint64_t)(radius * radius - dy * dy));
 }
 
-void alice_draw_circle(alice_window *window, int center_x, int center_y, int radius, uint32_t color) {
+void alice_draw_circle(alice_surface *surface, int center_x, int center_y, int radius, uint32_t color) {
     int64_t first, last, y;
 
-    if (!window || !window->pixels || radius < 0)
+    if (!surface || !surface->pixels || radius < 0)
         return;
 
     first = (int64_t)center_y - radius;
     last  = (int64_t)center_y + radius;
     if (first < 0)
         first = 0;
-    if (last >= window->height)
-        last = (int64_t)window->height - 1;
+    if (last >= surface->height)
+        last = (int64_t)surface->height - 1;
 
     for (y = first; y <= last; ++y) {
         int64_t reach = alice_circle_reach(radius, y - center_y);
-        alice_span(window, (int64_t)center_x - reach, (int64_t)center_x + reach, y, color);
+        alice_span(surface, (int64_t)center_x - reach, (int64_t)center_x + reach, y, color);
     }
 }
 
-void alice_draw_circle_outline(alice_window *window, int center_x, int center_y, int radius, uint32_t color) {
+void alice_draw_circle_outline(alice_surface *surface, int center_x, int center_y, int radius, uint32_t color) {
     int64_t first, last, y;
 
-    if (!window || !window->pixels || radius < 0)
+    if (!surface || !surface->pixels || radius < 0)
         return;
 
     first = (int64_t)center_y - radius;
     last  = (int64_t)center_y + radius;
     if (first < 0)
         first = 0;
-    if (last >= window->height)
-        last = (int64_t)window->height - 1;
+    if (last >= surface->height)
+        last = (int64_t)surface->height - 1;
 
     for (y = first; y <= last; ++y) {
         int64_t dy    = y - center_y;
@@ -2455,13 +2550,13 @@ void alice_draw_circle_outline(alice_window *window, int center_x, int center_y,
         int64_t inner = (above < below ? above : below) + 1;
         if (inner > reach) inner = reach;
         
-        alice_span(window, (int64_t)center_x + inner, (int64_t)center_x + reach, y, color);
-        alice_span(window, (int64_t)center_x - reach, (int64_t)center_x - inner, y, color);
+        alice_span(surface, (int64_t)center_x + inner, (int64_t)center_x + reach, y, color);
+        alice_span(surface, (int64_t)center_x - reach, (int64_t)center_x - inner, y, color);
     }
 }
 
 static bool alice_blit_clip(
-    const alice_window *window, int x, int y, int width, int height,
+    const alice_surface *surface, int x, int y, int width, int height,
     int64_t *first_col, int64_t *last_col, int64_t *first_row, int64_t *last_row
 ) {
     *first_col = x < 0 ? -(int64_t)x : 0;
@@ -2469,18 +2564,18 @@ static bool alice_blit_clip(
     *last_col  = (int64_t)width  - 1;
     *last_row  = (int64_t)height - 1;
 
-    if (*last_col > (int64_t)window->width  - 1 - x)
-        *last_col = (int64_t)window->width  - 1 - x;
+    if (*last_col > (int64_t)surface->width  - 1 - x)
+        *last_col = (int64_t)surface->width  - 1 - x;
 
-    if (*last_row > (int64_t)window->height - 1 - y)
-        *last_row = (int64_t)window->height - 1 - y;
+    if (*last_row > (int64_t)surface->height - 1 - y)
+        *last_row = (int64_t)surface->height - 1 - y;
 
     return *first_col <= *last_col
         && *first_row <= *last_row;
 }
 
 static bool alice_blit_backwards(
-    const alice_window *window, int x, int y, const uint32_t *pixels, size_t stride,
+    const alice_surface *surface, int x, int y, const uint32_t *pixels, size_t stride,
     int64_t first_col, int64_t first_row
 ) {
     const char *source
@@ -2490,30 +2585,30 @@ static bool alice_blit_backwards(
 
     const char *target
     =   (const char *) (
-            window->pixels
+            surface->pixels
             +   (size_t)(y + first_row)
-            *   (size_t)window->width
+            *   (size_t)surface->width
             +   (size_t)(x + first_col)
         );
     return (uintptr_t)target > (uintptr_t)source;
 }
 
-void alice_blit(alice_window *window, int x, int y, const uint32_t *pixels, int width, int height, int pitch) {
+void alice_blit(alice_surface *surface, int x, int y, const uint32_t *pixels, int width, int height, int pitch) {
     int64_t first_col, last_col, first_row, last_row, count;
     size_t stride;
     bool backwards;
 
-    if (!window
-    ||  !window->pixels
+    if (!surface
+    ||  !surface->pixels
     ||  !pixels
     ||  width <= 0 || height <= 0
     ||  pitch < 0
     )   return;
-    if (!alice_blit_clip(window, x, y, width, height, &first_col, &last_col, &first_row, &last_row))
+    if (!alice_blit_clip(surface, x, y, width, height, &first_col, &last_col, &first_row, &last_row))
         return;
 
     stride = pitch ? (size_t)pitch : (size_t)width * sizeof(uint32_t);
-    backwards = alice_blit_backwards(window, x, y, pixels, stride, first_col, first_row);
+    backwards = alice_blit_backwards(surface, x, y, pixels, stride, first_col, first_row);
 
     for (count = first_row; count <= last_row; ++count) {
         int64_t row = backwards ? last_row - (count - first_row) : count;
@@ -2523,9 +2618,9 @@ void alice_blit(alice_window *window, int x, int y, const uint32_t *pixels, int 
         +   (size_t)first_col * sizeof(uint32_t);
         
         uint32_t *target
-        =   window->pixels
+        =   surface->pixels
         +   (size_t)(y + row)
-        *   (size_t)window->width
+        *   (size_t)surface->width
         +   (size_t)(x + first_col);
 
         memmove(target, source, (size_t)(last_col - first_col + 1) * sizeof(uint32_t));
@@ -2533,7 +2628,7 @@ void alice_blit(alice_window *window, int x, int y, const uint32_t *pixels, int 
 }
 
 void alice_blit_keyed(
-    alice_window *window,
+    alice_surface *surface,
     int x, int y,
     const uint32_t *pixels,
     int width, int height,
@@ -2544,14 +2639,14 @@ void alice_blit_keyed(
     size_t stride;
     bool backwards;
 
-    if (!window || !window->pixels || !pixels || width <= 0 || height <= 0 || pitch < 0)
+    if (!surface || !surface->pixels || !pixels || width <= 0 || height <= 0 || pitch < 0)
         return;
-    if (!alice_blit_clip(window, x, y, width, height, &first_col, &last_col, &first_row, &last_row))
+    if (!alice_blit_clip(surface, x, y, width, height, &first_col, &last_col, &first_row, &last_row))
         return;
 
     key &= 0xFFFFFFu;
     stride = pitch ? (size_t)pitch : (size_t)width * sizeof(uint32_t);
-    backwards = alice_blit_backwards(window, x, y, pixels, stride, first_col, first_row);
+    backwards = alice_blit_backwards(surface, x, y, pixels, stride, first_col, first_row);
 
     for (count = first_row; count <= last_row; ++count) {
         int64_t row = backwards ? last_row - (count - first_row) : count;
@@ -2560,9 +2655,9 @@ void alice_blit_keyed(
                 (const char *)pixels + (size_t)row * stride
             );
         uint32_t *target
-        =   window->pixels
+        =   surface->pixels
         +   (size_t)(y + row)
-        *   (size_t)window->width
+        *   (size_t)surface->width
         +   (size_t)x;
 
         for (col = first_col; col <= last_col; ++col) {
@@ -2572,6 +2667,121 @@ void alice_blit_keyed(
             }
         }
     }
+}
+
+void alice_draw_surface(alice_surface *target, int x, int y, const alice_surface *source) {
+    if (!source || !source->pixels)
+        return;
+    alice_blit(target, x, y, source->pixels, source->width, source->height, source->pitch);
+}
+
+void alice_draw_surface_keyed(alice_surface *target, int x, int y, const alice_surface *source, uint32_t key) {
+    if (!source || !source->pixels)
+        return;
+    alice_blit_keyed(target, x, y, source->pixels, source->width, source->height, source->pitch, key);
+}
+
+void alice_draw_surface_part(
+    alice_surface *target, int x, int y,
+    const alice_surface *source, int source_x, int source_y, int width, int height
+) {
+    int64_t left, top, right, bottom, new_x, new_y;
+
+    if (!source || !source->pixels || width <= 0 || height <= 0)
+        return;
+
+    left   = source_x < 0 ? 0 : source_x;
+    top    = source_y < 0 ? 0 : source_y;
+    right  = (int64_t)source_x + width;
+    bottom = (int64_t)source_y + height;
+    if (right > source->width)
+        right = source->width;
+    if (bottom > source->height)
+        bottom = source->height;
+    if (left >= right || top >= bottom)
+        return;
+
+    new_x = (int64_t)x + (left - source_x);
+    new_y = (int64_t)y + (top - source_y);
+    if (new_x > INT_MAX || new_y > INT_MAX)
+        return;
+
+    alice_blit(
+        target, (int)new_x, (int)new_y,
+        source->pixels + (size_t)top * (size_t)source->width + (size_t)left,
+        (int)(right - left), (int)(bottom - top), source->pitch
+    );
+}
+
+static int64_t alice_stretch_index(int64_t position, int64_t size, bool flip, int64_t source_start, int64_t source_size) {
+    if (flip)
+        position = size - 1 - position;
+    return source_start + position * source_size / size;
+}
+
+void alice_draw_surface_stretched(
+    alice_surface *target, int x, int y, int width, int height,
+    const alice_surface *source, int source_x, int source_y, int source_width, int source_height
+) {
+    alice_surface *snapshot = NULL;
+    int64_t span_w, span_h, first_col, last_col, first_row, last_row, row, col;
+    bool flip_x = width < 0, flip_y = height < 0;
+    int *columns;
+
+    if (!target || !target->pixels || !source || !source->pixels
+    ||  width == 0 || height == 0 || source_width <= 0 || source_height <= 0)
+        return;
+
+    span_w = flip_x ? -(int64_t)width : width;
+    span_h = flip_y ? -(int64_t)height : height;
+
+    first_col = x < 0 ? 0 : x;
+    first_row = y < 0 ? 0 : y;
+    last_col  = (int64_t)x + span_w - 1;
+    last_row  = (int64_t)y + span_h - 1;
+    if (last_col >= target->width)
+        last_col = (int64_t)target->width - 1;
+    if (last_row >= target->height)
+        last_row = (int64_t)target->height - 1;
+    if (first_col > last_col || first_row > last_row)
+        return;
+
+    if (source == target) {
+        snapshot = alice_surface_clone(source);
+        if (!snapshot)
+            return;
+        source = snapshot;
+    }
+
+    columns = (int *)ALICE_MALLOC((size_t)(last_col - first_col + 1) * sizeof(int));
+    if (columns) {
+        for (col = first_col; col <= last_col; ++col) {
+            int64_t source_col = alice_stretch_index(col - x, span_w, flip_x, source_x, source_width);
+            columns[col - first_col] = source_col >= 0 && source_col < source->width ? (int)source_col : -1;
+        }
+    }
+
+    for (row = first_row; row <= last_row; ++row) {
+        int64_t source_row = alice_stretch_index(row - y, span_h, flip_y, source_y, source_height);
+        const uint32_t *in;
+        uint32_t *out;
+
+        if (source_row < 0 || source_row >= source->height)
+            continue;
+        in  = source->pixels + (size_t)source_row * (size_t)source->width;
+        out = target->pixels + (size_t)row * (size_t)target->width;
+
+        for (col = first_col; col <= last_col; ++col) {
+            int64_t source_col = columns
+                ? columns[col - first_col]
+                : alice_stretch_index(col - x, span_w, flip_x, source_x, source_width);
+            if (source_col >= 0 && source_col < source->width)
+                out[col] = in[source_col];
+        }
+    }
+
+    ALICE_FREE(columns);
+    alice_surface_destroy(snapshot);
 }
 
 static FILE *alice_fopen_write(const char *path) {
@@ -2603,7 +2813,7 @@ static void alice_put_u32(unsigned char *out, uint32_t value) {
     out[3] = (unsigned char)((value >> 24) & 0xFFu);
 }
 
-bool alice_save_bmp(const alice_window *window, const char *path) {
+bool alice_save_bmp(const alice_surface *surface, const char *path) {
     unsigned char header[54];
     unsigned char *row;
     size_t stride;
@@ -2612,11 +2822,11 @@ bool alice_save_bmp(const alice_window *window, const char *path) {
     bool ok = true;
     int x, y;
 
-    if (!window || !window->pixels || !path)
+    if (!surface || !surface->pixels || !path)
         return false;
 
-    stride = ((size_t)window->width * 3u + 3u) & ~(size_t)3u;
-    image_size = (uint32_t)(stride * (size_t)window->height);
+    stride = ((size_t)surface->width * 3u + 3u) & ~(size_t)3u;
+    image_size = (uint32_t)(stride * (size_t)surface->height);
 
     memset(header, 0, sizeof(header));
     header[0] = 'B';
@@ -2624,8 +2834,8 @@ bool alice_save_bmp(const alice_window *window, const char *path) {
     alice_put_u32(header + 2, 54u + image_size);        // file size
     alice_put_u32(header + 10, 54u);                    // start of pixels
     alice_put_u32(header + 14, 40u);                    // size of the info header
-    alice_put_u32(header + 18, (uint32_t)window->width);
-    alice_put_u32(header + 22, (uint32_t)window->height);
+    alice_put_u32(header + 18, (uint32_t)surface->width);
+    alice_put_u32(header + 22, (uint32_t)surface->height);
     header[26] = 1;                                     // planes
     header[28] = 24;                                    // bits per pixel
     alice_put_u32(header + 34, image_size);
@@ -2644,9 +2854,9 @@ bool alice_save_bmp(const alice_window *window, const char *path) {
     }
 
     ok = fwrite(header, sizeof(header), 1, file) == 1;
-    for (y = window->height - 1; ok && y >= 0; --y) {
-        const uint32_t *source = window->pixels + (size_t)y * (size_t)window->width;
-        for (x = 0; x < window->width; ++x) {
+    for (y = surface->height - 1; ok && y >= 0; --y) {
+        const uint32_t *source = surface->pixels + (size_t)y * (size_t)surface->width;
+        for (x = 0; x < surface->width; ++x) {
             row[x * 3 + 0] = (unsigned char)(source[x] & 0xFFu);
             row[x * 3 + 1] = (unsigned char)((source[x] >> 8) & 0xFFu);
             row[x * 3 + 2] = (unsigned char)((source[x] >> 16) & 0xFFu);

@@ -32,6 +32,8 @@ int main(int argc, char const *argv[]) {
     alice_window *window = alice_create(&config);
     if (!window) return 1;
 
+    alice_surface *screen = alice_get_surface(window);
+
     uint32_t draw_colour = 0xFFFFFFFF;
 
     Vec3 verts[8] = {
@@ -81,10 +83,10 @@ int main(int argc, char const *argv[]) {
         }
 
         // drawing
-        alice_clear(window, 0xFF000000);
+        alice_clear(screen, 0xFF000000);
 
         for (int i = 0; i < 12; i++) {
-            alice_draw_line(window, sx2d[edges[i].a], sy2d[edges[i].a], sx2d[edges[i].b], sy2d[edges[i].b], draw_colour);
+            alice_draw_line(screen, sx2d[edges[i].a], sy2d[edges[i].a], sx2d[edges[i].b], sy2d[edges[i].b], draw_colour);
         }
 
         alice_present(window);

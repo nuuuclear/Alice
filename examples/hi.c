@@ -13,7 +13,7 @@
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 void draw_wavey_string(
-    alice_window *window,
+    alice_surface *surface,
     int x, int y,
     const char *text,
     const alice_text_style *style
@@ -36,6 +36,8 @@ int main(void) {
 
     alice_window *window = alice_create(&config);
     if (!window) return 1;
+    
+    alice_surface *screen = alice_get_surface(window);
 
     alice_text_style style;
     alice_text_style_init(&style);
@@ -58,7 +60,7 @@ int main(void) {
         hue += 0.2;
 
         // drawing
-        alice_clear(window, alice_darken(alice_hue((uint16_t)hue), 0.5));
+        alice_clear(screen, alice_darken(alice_hue((uint16_t)hue), 0.5));
 
         uint16_t current_y = 10;
         for (size_t i = 0; i < ARRAY_SIZE(strings); i++) {
@@ -67,10 +69,10 @@ int main(void) {
             int x_pos = (config.width / 2) - (width / 2);
 
             style.color = 0x000000;
-            draw_wavey_string(window, x_pos, current_y + 1, strings[i], &style);
+            draw_wavey_string(screen, x_pos, current_y + 1, strings[i], &style);
 
             style.color = 0xFFFFFF;
-            draw_wavey_string(window, x_pos, current_y, strings[i], &style);
+            draw_wavey_string(screen, x_pos, current_y, strings[i], &style);
 
             current_y += 10;
         }
@@ -93,7 +95,7 @@ int utf8_char_len(unsigned char c) {
 }
 
 void draw_wavey_string(
-    alice_window *window,
+    alice_surface *surface,
     int x, int y,
     const char *text,
     const alice_text_style *style
@@ -114,7 +116,7 @@ void draw_wavey_string(
 
         float offset_y = sinf((char_index * speed) + (alice_time() / 600.0f)) * amp;
 
-        alice_draw_text(window, x + cursor_x, y + (int)roundf(offset_y), character, style);
+        alice_draw_text(surface, x + cursor_x, y + (int)roundf(offset_y), character, style);
 
         int width = 0;
         alice_measure_text(character, style, &width, 0);

@@ -7,6 +7,7 @@ Great for projects such as emulators, demos, or learning.
 
 #### alice.h
 - Basic window managment
+- Drawing surfaces
 - Keyboard and mouse input
 - A software renderer with basic graphics API such as rect or line drawing
 - Colour manipulation functions
@@ -18,7 +19,7 @@ Great for projects such as emulators, demos, or learning.
 - Includes a basic waveform synthesizer
 
 #### alice_text.h
-- Text renderer
+- Bitmap text renderer
 - ASCII, UTF-8, and Shift-JIS
 - Formatting and converters between formats
 - Includes build-in 'Misaki Gothic' font (this can be disabled)
