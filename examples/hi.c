@@ -68,10 +68,10 @@ int main(void) {
             alice_measure_text(strings[i], &style, &width, 0);
             int x_pos = (config.width / 2) - (width / 2);
 
-            style.color = 0x000000;
+            style.color = 0xFF000000;
             draw_wavey_string(screen, x_pos, current_y + 1, strings[i], &style);
 
-            style.color = 0xFFFFFF;
+            style.color = 0xFFFFFFFF;
             draw_wavey_string(screen, x_pos, current_y, strings[i], &style);
 
             current_y += 10;
