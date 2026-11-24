@@ -897,10 +897,12 @@ void alice_text_style_init(alice_text_style *style) {
     style->font    = alice_font_builtin();
 #endif
     style->encoding  = ALICE_ENCODING_UTF8;
-    style->color     = 0xFFFFFFu;
+    style->color     = 0xFFFFFFFFu;
     style->scale     = 1;
     style->tab_width = 4;
 }
+
+static int alice_text_clamp(int64_t value);
 
 static void alice_text_blit(
     alice_surface *surface, const alice_glyph *g, int x, int y,
@@ -908,9 +910,13 @@ static void alice_text_blit(
 ) {
     int row, col;
 
+    if (!surface || !surface->pixels || !g || !g->bits
+    ||  g->width <= 0 || g->height <= 0 || g->stride <= 0 || scale <= 0)
+        return;
+
     for (row = 0; row < g->height; ++row) {
         const uint8_t *bits = g->bits + (size_t)row * (size_t)g->stride;
-        int py = y + row * scale;
+        int64_t py = (int64_t)y + (int64_t)row * scale;
 
         if (py >= surface->height || py + scale <= 0)
             continue;
@@ -927,7 +933,15 @@ static void alice_text_blit(
             while (col < g->width && (bits[col >> 3] & (0x80u >> (col & 7)))) {
                 ++col;
             }
-            alice_draw_rect(surface, x + start * scale, py, (col - start) * scale, scale, color);
+            
+            alice_draw_rect(
+                surface,
+                alice_text_clamp((int64_t)x + (int64_t)start * scale),
+                alice_text_clamp(py),
+                alice_text_clamp((int64_t)(col - start) * scale),
+                scale,
+                color
+            );
         }
     }
 }
@@ -978,9 +992,12 @@ static int alice_text_run(
     line_spacing = alice_text_clamp_style(style.line_spacing);
     if (out_w) *out_w = 0;
     if (out_h) *out_h = 0;
-    if (!font) return x;
+    if (!font || font->height <= 0 || !it)
+        return x;
 
     line_h = alice_text_clamp((int64_t)font->height * scale);
+    if (line_h <= 0)
+        line_h = 1;
     space_adv = alice_font_glyph(font, ' ', &g) ? g.advance : font->height / 2;
     {
         int64_t tabs = style.tab_width > 0 ? style.tab_width : 4;

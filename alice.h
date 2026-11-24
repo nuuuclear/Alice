@@ -920,7 +920,14 @@ static void alice_win_paint(alice_window *window) {
 
     if (!window->hwnd
     ||  !window->dc
+    ||  !window->mem_dc
     ||  !window->dib
+    ||  !window->dib_pixels
+    ||  !window->column_map
+    ||  window->dib_width <= 0
+    ||  window->dib_height <= 0
+    ||  window->view_w <= 0
+    ||  window->view_h <= 0
     ||  client_width <= 0
     ||  client_height <= 0
     ) return;
@@ -947,6 +954,9 @@ static void alice_win_paint(alice_window *window) {
         }
         window->borders_dirty = false;
     }
+
+    if (!alice_win_sync_dib(window))
+        return;
 
     alice_fill_scaled(
         window, window->dib_pixels, (size_t)window->dib_width * sizeof(uint32_t),
@@ -2112,8 +2122,11 @@ static void alice_backend_pump(alice_window *window) {
 
 static bool alice_surface_setup(alice_surface *surface, int width, int height) {
     memset(surface, 0, sizeof(*surface));
-    if (width <= 0 || height <= 0 || width > ALICE_MAX_WINDOW_SIDE || height > ALICE_MAX_WINDOW_SIDE)
-        return false;
+    if (width <= 0 || height <= 0
+    ||  width > ALICE_MAX_WINDOW_SIDE
+    ||  height > ALICE_MAX_WINDOW_SIDE
+    ||  (size_t)width > SIZE_MAX / sizeof(uint32_t) / (size_t)height
+    ) return false;
 
     surface->pixels = (uint32_t *)ALICE_CALLOC((size_t)width * (size_t)height, sizeof(uint32_t));
     if (!surface->pixels)
@@ -2367,88 +2380,103 @@ static bool alice_line_before(
         || (source_y > 0 ? y < 0 : y >= surface->height);
 }
 
-static void alice_draw_line_internal(
-    alice_surface *surface,
-    int start_x, int start_y,
-    int end_x, int end_y,
-    int thickness,
-    uint32_t color,
-    int thick
-) {
-    int64_t delta_x, delta_y, error_code;
-    uint64_t array, button, value_count, low_value, high_value, scale_factor, xs, ys, event;
-    int64_t x, y;
-    int source_x, source_y;
+static unsigned alice_line_outcode(const alice_surface *surface, double x, double y) {
+    unsigned code = 0;
+    if (x < 0.0) code |= 1u;
+    else if (x >= surface->width) code |= 2u;
+    if (y < 0.0) code |= 4u;
+    else if (y >= surface->height) code |= 8u;
+    return code;
+}
 
-    if (!surface || !surface->pixels)
-        return;
+static bool alice_clip_line(const alice_surface *surface, int *x0, int *y0, int *x1, int *y1) {
+    double ax = *x0, ay = *y0, bx = *x1, by = *y1;
+    unsigned code_a = alice_line_outcode(surface, ax, ay);
+    unsigned code_b = alice_line_outcode(surface, bx, by);
 
-    if (start_x == end_x && start_y == end_y) {
-        if (thick)
-            alice_draw_circle(surface, start_x, start_y, thickness, color);
-        else
-            alice_draw_point(surface, start_x, start_y, color);
-        return;
-    }
+    for (;;) {
+        double x, y;
+        unsigned code;
+        if (!(code_a | code_b)) break;
+        if (code_a & code_b) return false;
+        code = code_a ? code_a : code_b;
 
-    if (alice_region(surface, start_x, start_y) & alice_region(surface, end_x, end_y))
-        return;
+        if (code & 8u) {
+            if (by == ay) return false;
+            x = ax + (bx - ax) * ((surface->height - 1.0 - ay) / (by - ay));
+            y = surface->height - 1.0;
 
-    delta_x = end_x > start_x ? (int64_t)end_x - start_x : (int64_t)start_x - end_x;
-    delta_y = end_y > start_y ? -((int64_t)end_y - start_y) : -((int64_t)start_y - end_y);
-    source_x = start_x < end_x ? 1 : -1;
-    source_y = start_y < end_y ? 1 : -1;
+        } else if (code & 4u) {
+            if (by == ay) return false;
+            x = ax + (bx - ax) * ((0.0 - ay) / (by - ay));
+            y = 0.0;
 
-    array = (uint64_t)delta_x;
-    button = (uint64_t)-delta_y;
-    value_count = array >= button ? array : button;
+        } else if (code & 2u) {
+            if (bx == ax) return false;
+            y = ay + (by - ay) * ((surface->width - 1.0 - ax) / (bx - ax));
+            x = surface->width - 1.0;
 
-    low_value = 0;
-    high_value = value_count + 1;
-    
-    while (low_value < high_value) {
-        uint64_t mid = low_value + (high_value - low_value) / 2;
-
-        if (alice_line_before(surface, start_x, start_y, source_x, source_y, mid, array, button))
-            low_value = mid + 1;
-        else
-            high_value = mid;
-    }
-
-    if (low_value > value_count)
-        return;
-
-    scale_factor = low_value;
-
-    alice_line_steps(scale_factor, array, button, &xs, &ys);
-    x = (int64_t)start_x + source_x * (int64_t)xs;
-    y = (int64_t)start_y + source_y * (int64_t)ys;
-    event = array - button - xs * button + ys * array;
-    error_code = event <= (uint64_t)INT64_MAX ? (int64_t)event : -(int64_t)(~event) - 1;
-
-    for (;; ++scale_factor) {
-        int64_t e2;
-
-        if (x < 0 || y < 0 || x >= surface->width || y >= surface->height)
-            break;
-
-        if (thick)
-            alice_draw_circle(surface, x, y, thickness, color);
-        else
-            alice_put_pixel(surface, (size_t)y * (size_t)surface->width + (size_t)x, color);
-
-        if (scale_factor == value_count)
-            break;
-
-        e2 = 2 * error_code;
-        if (e2 >= delta_y) {
-            error_code += delta_y;
-            x += source_x;
+        } else {
+            if (bx == ax) return false;
+            y = ay + (by - ay) * ((0.0 - ax) / (bx - ax));
+            x = 0.0;
         }
 
-        if (e2 <= delta_x) {
-            error_code += delta_x;
-            y += source_y;
+        if (code == code_a) {
+            ax = x;
+            ay = y;
+            code_a = alice_line_outcode(surface, ax, ay);
+        }
+        else {
+            bx = x;
+            by = y;
+            code_b = alice_line_outcode(surface, bx, by);
+        }
+    }
+    
+    *x0 = (int)(ax + 0.5); *y0 = (int)(ay + 0.5);
+    *x1 = (int)(bx + 0.5); *y1 = (int)(by + 0.5);
+    return true;
+}
+
+static void alice_draw_line_internal(
+    alice_surface *surface, int start_x, int start_y, int end_x, int end_y,
+    int thickness, uint32_t color, int thick
+) {
+    int64_t dx, dy, error;
+    int step_x, step_y;
+
+    if (!surface
+    ||  !surface->pixels
+    ||  (color >> 24) == 0
+    ||  (thick && thickness < 0)
+    )   return;
+    if (!alice_clip_line(surface, &start_x, &start_y, &end_x, &end_y))
+        return;
+
+    dx = llabs((int64_t)end_x - start_x);
+    dy = -llabs((int64_t)end_y - start_y);
+    step_x = start_x < end_x ? 1 : -1;
+    step_y = start_y < end_y ? 1 : -1;
+    error = dx + dy;
+
+    for (;;) {
+        if (thick) 
+            alice_draw_circle(surface, start_x, start_y, thickness, color);
+        else 
+            alice_put_pixel(surface, (size_t)start_y * (size_t)surface->width + (size_t)start_x, color);
+
+        if (start_x == end_x && start_y == end_y)
+            break;
+        
+        {
+            int64_t twice_error = error * 2;
+            if (twice_error >= dy) {
+                error += dy; start_x += step_x;
+            }
+            if (twice_error <= dx) {
+                error += dx; start_y += step_y;
+            }
         }
     }
 }
@@ -2508,9 +2536,10 @@ uint32_t alice_get_pixel(const alice_surface *surface, int x, int y) {
 
 // a horizontal run of pixels
 static void alice_span(alice_surface *surface, int64_t start_x, int64_t end_x, int64_t y, uint32_t color) {
-    uint32_t *row;
+    size_t row_start;
+    int64_t pixel_x;
 
-    if (y < 0 || y >= surface->height)
+    if (!surface || !surface->pixels || y < 0 || y >= surface->height)
         return;
     if (start_x < 0)
         start_x = 0;
@@ -2519,9 +2548,9 @@ static void alice_span(alice_surface *surface, int64_t start_x, int64_t end_x, i
     if (start_x > end_x)
         return;
 
-    row = surface->pixels + (size_t)y * (size_t)surface->width;
-    for (; start_x <= end_x; ++start_x) {
-        alice_put_pixel(surface, (size_t)row - (size_t)surface->pixels + (size_t)start_x, color);
+    row_start = (size_t)y * (size_t)surface->width;
+    for (pixel_x = start_x; pixel_x <= end_x; ++pixel_x) {
+        alice_put_pixel(surface, row_start + (size_t)pixel_x, color);
     }
 }
 
@@ -2572,48 +2601,73 @@ static int64_t alice_circle_reach(int64_t radius, int64_t dy) {
     return (int64_t)alice_isqrt((uint64_t)(radius * radius - dy * dy));
 }
 
+static void alice_circle_point(alice_surface *surface, int64_t x, int64_t y, uint32_t color) {
+    if (x >= 0 && y >= 0 && x < surface->width && y < surface->height) {
+        alice_put_pixel(surface, (size_t)y * (size_t)surface->width + (size_t)x, color);
+    }
+}
+
 void alice_draw_circle(alice_surface *surface, int center_x, int center_y, int radius, uint32_t color) {
-    int64_t first, last, y;
+    int64_t offset, reach, radius_squared;
+    if (!surface
+    ||  !surface->pixels
+    ||  radius < 0
+    ||  (color >> 24) == 0
+    ) return;
+    
+    radius_squared = (int64_t)radius * radius;
+    reach = radius;
 
-    if (!surface || !surface->pixels || radius < 0)
-        return;
+    for (offset = 0; offset <= radius; ++offset) {
+        int64_t upper_y = (int64_t)center_y - offset;
+        int64_t lower_y = (int64_t)center_y + offset;
+        while (reach > 0 && reach * reach + offset * offset > radius_squared)
+            --reach;
 
-    first = (int64_t)center_y - radius;
-    last  = (int64_t)center_y + radius;
-    if (first < 0)
-        first = 0;
-    if (last >= surface->height)
-        last = (int64_t)surface->height - 1;
-
-    for (y = first; y <= last; ++y) {
-        int64_t reach = alice_circle_reach(radius, y - center_y);
-        alice_span(surface, (int64_t)center_x - reach, (int64_t)center_x + reach, y, color);
+        if (upper_y >= 0 && upper_y < surface->height)
+            alice_span(surface, (int64_t)center_x - reach, (int64_t)center_x + reach, upper_y, color);
+        if (offset != 0 && lower_y >= 0 && lower_y < surface->height)
+            alice_span(surface, (int64_t)center_x - reach, (int64_t)center_x + reach, lower_y, color);
     }
 }
 
 void alice_draw_circle_outline(alice_surface *surface, int center_x, int center_y, int radius, uint32_t color) {
-    int64_t first, last, y;
+    int64_t x, y, decision;
+    if (!surface
+    ||  !surface->pixels
+    ||  radius < 0
+    ||  (color >> 24) == 0
+    ) return;
 
-    if (!surface || !surface->pixels || radius < 0)
-        return;
+    x = radius;
+    y = 0;
+    decision = 1 - x;
 
-    first = (int64_t)center_y - radius;
-    last  = (int64_t)center_y + radius;
-    if (first < 0)
-        first = 0;
-    if (last >= surface->height)
-        last = (int64_t)surface->height - 1;
+    while (x >= y) {
 
-    for (y = first; y <= last; ++y) {
-        int64_t dy    = y - center_y;
-        int64_t reach = alice_circle_reach(radius, dy);
-        int64_t above = alice_circle_reach(radius, dy - 1);
-        int64_t below = alice_circle_reach(radius, dy + 1);
-        int64_t inner = (above < below ? above : below) + 1;
-        if (inner > reach) inner = reach;
-        
-        alice_span(surface, (int64_t)center_x + inner, (int64_t)center_x + reach, y, color);
-        alice_span(surface, (int64_t)center_x - reach, (int64_t)center_x - inner, y, color);
+        alice_circle_point(surface, (int64_t)center_x + x, (int64_t)center_y + y, color);
+        if (x) alice_circle_point(surface, (int64_t)center_x - x, (int64_t)center_y + y, color);
+        if (y) {
+            alice_circle_point(surface, (int64_t)center_x + x, (int64_t)center_y - y, color);
+            if (x) alice_circle_point(surface, (int64_t)center_x - x, (int64_t)center_y - y, color);
+        }
+
+        if (x != y) {
+            alice_circle_point(surface, (int64_t)center_x + y, (int64_t)center_y + x, color);
+            if (y) alice_circle_point(surface, (int64_t)center_x - y, (int64_t)center_y + x, color);
+            if (x) {
+                alice_circle_point(surface, (int64_t)center_x + y, (int64_t)center_y - x, color);
+                if (y) alice_circle_point(surface, (int64_t)center_x - y, (int64_t)center_y - x, color);
+            }
+        }
+
+        ++y;
+        if (decision < 0)
+            decision += 2 * y + 1;
+        else {
+            --x;
+            decision += 2 * (y - x) + 1;
+        }
     }
 }
 
@@ -2662,6 +2716,8 @@ void alice_blit(alice_surface *surface, int x, int y, const uint32_t *pixels, in
 
     if (!surface || !surface->pixels || !pixels || width <= 0 || height <= 0 || pitch < 0)
         return;
+    if (pitch && (size_t)pitch < (size_t)width * sizeof(uint32_t))
+        return;
     if (!alice_blit_clip(surface, x, y, width, height, &first_col, &last_col, &first_row, &last_row))
         return;
 
@@ -2677,7 +2733,7 @@ void alice_blit(alice_surface *surface, int x, int y, const uint32_t *pixels, in
         =   surface->pixels
         +   (size_t)(y + row)
         *   (size_t)surface->width
-        +   (size_t)x;
+        +   (size_t)(x + first_col);
 
         int64_t col;
         bool opaque = true;
@@ -2690,7 +2746,7 @@ void alice_blit(alice_surface *surface, int x, int y, const uint32_t *pixels, in
         }
 
         if (opaque) {
-            memmove(target_row + first_col, source_row + first_col, (size_t)(last_col - first_col + 1) * sizeof(uint32_t));
+            memmove(target_row, source_row + first_col, (size_t)(last_col - first_col + 1) * sizeof(uint32_t));
             continue;
         }
 
@@ -2698,17 +2754,17 @@ void alice_blit(alice_surface *surface, int x, int y, const uint32_t *pixels, in
             for (col = last_col; col >= first_col; --col) {
                 uint32_t color = source_row[col];
                 if ((color >> 24) == 255u)
-                    target_row[col] = color;
+                    target_row[col - first_col] = color;
                 else if ((color >> 24) != 0u)
-                    target_row[col] = alice_blend_pixel(target_row[col], color);
+                    target_row[col - first_col] = alice_blend_pixel(target_row[col - first_col], color);
             }
         } else {
             for (col = first_col; col <= last_col; ++col) {
                 uint32_t color = source_row[col];
                 if ((color >> 24) == 255u)
-                    target_row[col] = color;
+                    target_row[col - first_col] = color;
                 else if ((color >> 24) != 0u)
-                    target_row[col] = alice_blend_pixel(target_row[col], color);
+                    target_row[col - first_col] = alice_blend_pixel(target_row[col - first_col], color);
             }
         }
     }
@@ -2728,6 +2784,8 @@ void alice_blit_keyed(
 
     if (!surface || !surface->pixels || !pixels || width <= 0 || height <= 0 || pitch < 0)
         return;
+    if (pitch && (size_t)pitch < (size_t)width * sizeof(uint32_t))
+        return;
     if (!alice_blit_clip(surface, x, y, width, height, &first_col, &last_col, &first_row, &last_row))
         return;
 
@@ -2741,12 +2799,6 @@ void alice_blit_keyed(
         =   (const uint32_t *)(
                 (const char *)pixels + (size_t)row * stride
             );
-        uint32_t *target
-        =   surface->pixels
-        +   (size_t)(y + row)
-        *   (size_t)surface->width
-        +   (size_t)x;
-
         for (col = first_col; col <= last_col; ++col) {
             int64_t c = backwards ? last_col - (col - first_col) : col;
             if ((source[c] & 0xFFFFFFu) != key) {
@@ -3096,44 +3148,55 @@ uint32_t alice_mix(uint32_t a, uint32_t b, float t) {
     int shift;
 
     t = alice_clamp01(t);
-    for (shift = 16; shift >= 0; shift -= 8) {
+
+    for (shift = 24; shift >= 0; shift -= 8) {
         float from = (float)((a >> shift) & 0xFFu);
-        float to   = (float)((b >> shift) & 0xFFu);
+        float to = (float)((b >> shift) & 0xFFu);
         out |= (uint32_t)(from + (to - from) * t + 0.5f) << shift;
     }
+
     return out;
 }
 
 uint32_t alice_lighten(uint32_t color, float amount) {
-    return alice_mix(color, 0xFFFFFFu, amount);
+    return alice_mix(color, (color & 0xFF000000u) | 0x00FFFFFFu, amount);
 }
 
 uint32_t alice_darken(uint32_t color, float amount) {
-    return alice_mix(color, 0x000000u, amount);
+    return alice_mix(color, color & 0xFF000000u, amount);
 }
 
 uint32_t alice_saturate(uint32_t color, float amount) {
-    float h, s, l;
-    alice_to_hsl(color, &h, &s, &l);
-    if (s <= 0.0f)
-        return color & 0xFFFFFFu;
-    return alice_hsl(h, s + (1.0f - s)* alice_clamp01(amount), l);
+    float hue, saturation, lightness;
+    alice_to_hsl(color, &hue, &saturation, &lightness);
+
+    if (saturation <= 0.0f)
+        return color;
+
+    return (color & 0xFF000000u)
+        |   (alice_hsl(hue, saturation + (1.0f - saturation) 
+        *   alice_clamp01(amount), lightness) & 0x00FFFFFFu);
 }
 
 uint32_t alice_desaturate(uint32_t color, float amount) {
-    float h, s, l;
-    alice_to_hsl(color, &h, &s, &l);
-    return alice_hsl(h, s * (1.0f - alice_clamp01(amount)), l);
+    float hue, saturation, lightness;
+    alice_to_hsl(color, &hue, &saturation, &lightness);
+
+    return (color & 0xFF000000u)
+        |   (alice_hsl(hue, saturation
+        *   (1.0f - alice_clamp01(amount)), lightness) & 0x00FFFFFFu);
 }
 
 uint32_t alice_rotate_hue(uint32_t color, float degrees) {
-    float h, s, v;
-    alice_to_hsv(color, &h, &s, &v);
-    return alice_hsv(h + alice_wrap_hue(degrees), s, v);
+    float hue, saturation, value;
+    alice_to_hsv(color, &hue, &saturation, &value);
+
+    return (color & 0xFF000000u)
+        | (alice_hsv(hue + alice_wrap_hue(degrees), saturation, value) & 0x00FFFFFFu);
 }
 
 uint32_t alice_invert(uint32_t color) {
-    return ~color & 0xFFFFFFu;
+    return (color & 0xFF000000u) | (~color & 0x00FFFFFFu);
 }
 
 int alice_luma(uint32_t color) {
@@ -3142,8 +3205,9 @@ int alice_luma(uint32_t color) {
 }
 
 uint32_t alice_grayscale(uint32_t color) {
-    uint32_t l = (uint32_t)alice_luma(color);
-    return (l << 16) | (l << 8) | l;
+    uint32_t luminance = (uint32_t)alice_luma(color);
+
+    return (color & 0xFF000000u) | (luminance << 16) | (luminance << 8) | luminance;
 }
 
 ////////////////////////////////////////////////////////////
