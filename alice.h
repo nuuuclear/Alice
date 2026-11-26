@@ -76,7 +76,7 @@ typedef struct alice_config {
     int scale;              // initial window size multiplier (of the framebuffer's size)
     bool resizable;
     bool stretch;           // fill the whole window with a non-integer stretch
-                            // (uneven pixel widths) instead of integer scaling
+    bool fit_window;
 } alice_config;
 
 typedef struct alice_surface {
@@ -85,6 +85,7 @@ typedef struct alice_surface {
     int height;
     int pitch;              // bytes per row
     bool window_owned;
+    alice_window *owner;
 } alice_surface;
 
 typedef alice_surface alice_framebuffer;
@@ -191,6 +192,8 @@ ALICE_API alice_surface *alice_get_surface(alice_window *window);
 ALICE_API alice_surface *alice_surface_create(int width, int height);
 ALICE_API alice_surface *alice_surface_clone(const alice_surface *surface);
 ALICE_API void alice_surface_destroy(alice_surface *surface);
+ALICE_API bool alice_surface_resize(alice_surface *surface, int width, int height);
+ALICE_API bool alice_surface_resize_stretched(alice_surface *surface, int width, int height);
 
 //// rendering
 
@@ -232,6 +235,7 @@ ALICE_API void alice_draw_surface_stretched(
 
 // save the framebuffer as BMP a file, returns false upon failure
 ALICE_API bool alice_save_bmp(const alice_surface *surface, const char *path);
+ALICE_API alice_surface *alice_load_bmp(const char *path);
 
 //// colour
 
@@ -397,6 +401,7 @@ struct alice_window {
     int             scale;
     bool            resizable;
     bool            stretch;
+    bool            fit_window;
 
     alice_surface   surface;
 
@@ -426,6 +431,7 @@ struct alice_window {
     uint32_t       *dib_pixels;
     int             dib_width, dib_height;
     int            *column_map;
+    int             map_source_width; // surface width column_map was built for
     bool            borders_dirty;
     int             wheel_remainder;
 #elif defined(ALICE_BACKEND_X11)
@@ -469,6 +475,7 @@ static bool alice_backend_create(alice_window *window, const alice_config *confi
 static void alice_backend_destroy(alice_window *window);
 static void alice_backend_pump(alice_window *window);
 static void alice_backend_present(alice_window *window);
+static bool alice_backend_resize(alice_window *window);
 
 static void alice_update_viewport(alice_window *window);
 
@@ -544,6 +551,11 @@ void alice_push_event(alice_window *window, const alice_event *event) {
         
         window->client_width  = event->width;
         window->client_height = event->height;
+        if (window->fit_window) {
+            int fit_w = event->width  / window->scale;
+            int fit_h = event->height / window->scale;
+            alice_surface_resize(&window->surface, fit_w < 1 ? 1 : fit_w, fit_h < 1 ? 1 : fit_h);
+        }
         alice_update_viewport(window);
         break;
 
@@ -770,6 +782,7 @@ static bool alice_backend_create(alice_window *window, const alice_config *confi
 static void alice_backend_destroy(alice_window *window)  { (void)window; }
 static void alice_backend_pump(alice_window *window)     { (void)window; }
 static void alice_backend_present(alice_window *window)  { (void)window; }
+static bool alice_backend_resize(alice_window *window)   { (void)window; return true; }
 
 #elif defined(ALICE_BACKEND_WIN32)
 
@@ -879,6 +892,7 @@ static bool alice_win_sync_dib(alice_window *window) {
     if (window->dib
     &&  window->dib_width == window->view_w
     &&  window->dib_height == window->view_h
+    &&  window->map_source_width == window->surface.width
     )   return true;
     if (window->view_w <= 0 || window->view_h <= 0)
         return false;
@@ -906,6 +920,7 @@ static bool alice_win_sync_dib(alice_window *window) {
     window->dib_pixels = (uint32_t *)bits;
     window->dib_width = window->view_w;
     window->dib_height = window->view_h;
+    window->map_source_width = window->surface.width;
     window->column_map = columns;
     for (x = 0; x < window->view_w; ++x) {
         columns[x] = alice_to_framebuffer(x, window->surface.width, window->view_w);
@@ -1206,6 +1221,10 @@ static void alice_backend_pump(alice_window *window) {
 
 static void alice_backend_present(alice_window *window) {
     alice_win_paint(window);
+}
+
+static bool alice_backend_resize(alice_window *window) {
+    return alice_win_sync_dib(window);
 }
 
 #elif defined(ALICE_BACKEND_X11)
@@ -1944,6 +1963,31 @@ static void alice_backend_present(alice_window *window) {
     alice_x_present(window);
 }
 
+static bool alice_backend_resize(alice_window *window) {
+    int *columns;
+    int x;
+
+    if (!window->display || !window->image)
+        return true;
+
+    if (window->view_w != window->image_width || window->view_h != window->image_height) {
+        if (!alice_x_resize_image(window, window->view_w, window->view_h))
+            return false;
+    } else {
+        columns = (int *)ALICE_MALLOC((size_t)window->image_width * sizeof(int));
+        if (!columns)
+            return false;
+        for (x = 0; x < window->image_width; ++x)
+            columns[x] = alice_to_framebuffer(x, window->surface.width, window->image_width);
+        ALICE_FREE(window->column_map);
+        window->column_map = columns;
+    }
+
+    if (window->window)
+        XClearWindow(window->display, window->window);
+    return true;
+}
+
 #elif defined(ALICE_BACKEND_SDL2)
 
 static const struct { SDL_Keycode key_symbol; int key; } alice_sdl_key_table[] = {
@@ -2045,6 +2089,24 @@ static void alice_backend_present(alice_window *window) {
         SDL_RenderCopy(window->renderer, window->texture, NULL, &destination_pixels);
     }
     SDL_RenderPresent(window->renderer);
+}
+
+static bool alice_backend_resize(alice_window *window) {
+    SDL_Texture *texture;
+
+    if (!window->renderer || !window->texture)
+        return true;
+
+    texture = SDL_CreateTexture(
+        window->renderer, SDL_PIXELFORMAT_ARGB8888,
+        SDL_TEXTUREACCESS_STREAMING, window->surface.width, window->surface.height
+    );
+    if (!texture)
+        return false;
+
+    SDL_DestroyTexture(window->texture);
+    window->texture = texture;
+    return true;
 }
 
 static void alice_backend_pump(alice_window *window) {
@@ -2158,12 +2220,14 @@ alice_window *alice_create(const alice_config *config) {
     window->client_width  = config->width * scale;
     window->client_height = config->height * scale;
     window->stretch       = config->stretch;
+    window->fit_window    = config->fit_window && config->resizable;
 
     if (!alice_surface_setup(&window->surface, config->width, config->height)) {
         ALICE_FREE(window);
         return NULL;
     }
     window->surface.window_owned = true;
+    window->surface.owner = window;
     alice_update_viewport(window);
 
     if (!alice_backend_create(window, config)) {
@@ -2252,6 +2316,97 @@ void alice_surface_destroy(alice_surface *surface) {
         return;
     ALICE_FREE(surface->pixels);
     ALICE_FREE(surface);
+}
+
+static bool alice_surface_resize_impl(alice_surface *surface, int width, int height, bool stretch) {
+    alice_window *window = NULL;
+    alice_surface previous;
+    uint32_t *pixels;
+    int y;
+
+    if (!surface)
+        return false;
+
+    if (surface->window_owned) {
+        window = surface->owner;
+        if (!window)
+            return false;
+        surface = &window->surface;
+    }
+
+    if (!surface->pixels
+    ||  width <= 0 || height <= 0
+    ||  width > ALICE_MAX_WINDOW_SIDE
+    ||  height > ALICE_MAX_WINDOW_SIDE
+    ||  (size_t)width > SIZE_MAX / sizeof(uint32_t) / (size_t)height
+    )   return false;
+
+    if (width == surface->width && height == surface->height)
+        return true;
+
+    pixels = (uint32_t *)ALICE_CALLOC((size_t)width * (size_t)height, sizeof(uint32_t));
+    if (!pixels)
+        return false;
+
+    if (stretch) {
+        int *columns = (int *)ALICE_MALLOC((size_t)width * sizeof(int));
+        int x;
+
+        if (!columns) {
+            ALICE_FREE(pixels);
+            return false;
+        }
+        for (x = 0; x < width; ++x)
+            columns[x] = (int)((int64_t)x * surface->width / width);
+
+        for (y = 0; y < height; ++y) {
+            const uint32_t *in = surface->pixels
+                + (size_t)((int64_t)y * surface->height / height) * (size_t)surface->width;
+            uint32_t *out = pixels + (size_t)y * (size_t)width;
+            for (x = 0; x < width; ++x)
+                out[x] = in[columns[x]];
+        }
+        ALICE_FREE(columns);
+        
+    } else {
+        int copy_width  = width  < surface->width  ? width  : surface->width;
+        int copy_height = height < surface->height ? height : surface->height;
+
+        for (y = 0; y < copy_height; ++y) {
+            memcpy(
+                pixels + (size_t)y * (size_t)width,
+                surface->pixels + (size_t)y * (size_t)surface->width,
+                (size_t)copy_width * sizeof(uint32_t)
+            );
+        }
+    }
+
+    previous = *surface;
+    surface->pixels = pixels;
+    surface->width  = width;
+    surface->height = height;
+    surface->pitch  = width * (int)sizeof(uint32_t);
+
+    if (window) {
+        alice_update_viewport(window);
+        if (!alice_backend_resize(window)) {
+            *surface = previous;
+            alice_update_viewport(window);
+            ALICE_FREE(pixels);
+            return false;
+        }
+    }
+
+    ALICE_FREE(previous.pixels);
+    return true;
+}
+
+bool alice_surface_resize(alice_surface *surface, int width, int height) {
+    return alice_surface_resize_impl(surface, width, height, false);
+}
+
+bool alice_surface_resize_stretched(alice_surface *surface, int width, int height) {
+    return alice_surface_resize_impl(surface, width, height, true);
 }
 
 ////////////////////////////////////////////////////////////
@@ -3008,12 +3163,152 @@ bool alice_save_bmp(const alice_surface *surface, const char *path) {
     return ok;
 }
 
+static FILE *alice_fopen_read(const char *path) {
+#if defined(_WIN32)
+    FILE *file;
+    wchar_t *wide;
+    int count = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+
+    if (count <= 0)
+        return fopen(path, "rb");
+
+    wide = (wchar_t *)ALICE_MALLOC((size_t)count * sizeof(wchar_t));
+    if (!wide) return NULL;
+
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, count);
+    file = _wfopen(wide, L"rb");
+    ALICE_FREE(wide);
+
+    return file;
+#else
+    return fopen(path, "rb");
+#endif
+}
+
+static uint32_t alice_get_u32(const unsigned char *in) {
+    return (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16) | ((uint32_t)in[3] << 24);
+}
+
+static int64_t alice_get_i32(const unsigned char *in) {
+    uint32_t raw = alice_get_u32(in);
+    return (raw & 0x80000000u) ? -(int64_t)(0x100000000ull - raw) : (int64_t)raw;
+}
+
+static alice_surface *alice_read_bmp(FILE *file) {
+    unsigned char header[54];
+    unsigned char masks[16];
+    alice_surface *surface;
+    unsigned char *row;
+    uint32_t data_offset, info_size, compression;
+    int64_t width, height;
+    int bits, x, y;
+    bool top_down;
+    bool any_alpha = false, has_alpha_mask = false;
+    bool opaque_only = false;
+    size_t stride;
+
+    if (fread(header, sizeof(header), 1, file) != 1 || header[0] != 'B' || header[1] != 'M')
+        return NULL;
+
+    data_offset = alice_get_u32(header + 10);
+    info_size   = alice_get_u32(header + 14);
+    width       = alice_get_i32(header + 18);
+    height      = alice_get_i32(header + 22);
+    bits        = (int)header[28] | ((int)header[29] << 8);
+    compression = alice_get_u32(header + 30);
+
+    if (info_size < 40u || (header[26] | (header[27] << 8)) != 1)
+        return NULL;
+
+    top_down = height < 0;
+    if (top_down)
+        height = -height;
+    if (width <= 0 || height <= 0 || width > ALICE_MAX_WINDOW_SIDE || height > ALICE_MAX_WINDOW_SIDE)
+        return NULL;
+
+    if (bits != 24 && bits != 32)
+        return NULL;
+
+    if (compression == 3u || compression == 6u) {
+        if (bits != 32 || fseek(file, 54, SEEK_SET) != 0 || fread(masks, 12, 1, file) != 1)
+            return NULL;
+        if (alice_get_u32(masks) != 0x00FF0000u
+        ||  alice_get_u32(masks + 4) != 0x0000FF00u
+        ||  alice_get_u32(masks + 8) != 0x000000FFu
+        )   return NULL;
+        if (info_size >= 56u && fread(masks + 12, 4, 1, file) == 1)
+            has_alpha_mask = alice_get_u32(masks + 12) == 0xFF000000u;
+        opaque_only = !has_alpha_mask;
+    } else if (compression != 0u) {
+        return NULL;
+    }
+
+    if (fseek(file, (long)data_offset, SEEK_SET) != 0)
+        return NULL;
+
+    surface = alice_surface_create((int)width, (int)height);
+    if (!surface)
+        return NULL;
+
+    stride = bits == 24 ? (((size_t)width * 3u + 3u) & ~(size_t)3u) : (size_t)width * 4u;
+    row = (unsigned char *)ALICE_MALLOC(stride);
+    if (!row) {
+        alice_surface_destroy(surface);
+        return NULL;
+    }
+
+    for (y = 0; y < (int)height; ++y) {
+        uint32_t *out = surface->pixels + (size_t)(top_down ? y : (int)height - 1 - y) * (size_t)width;
+
+        if (fread(row, stride, 1, file) != 1) {
+            ALICE_FREE(row);
+            alice_surface_destroy(surface);
+            return NULL;
+        }
+        for (x = 0; x < (int)width; ++x) {
+            if (bits == 24) {
+                out[x] = 0xFF000000u | ((uint32_t)row[x * 3 + 2] << 16)
+                       | ((uint32_t)row[x * 3 + 1] << 8) | (uint32_t)row[x * 3];
+            } else {
+                uint32_t alpha = row[x * 4 + 3];
+                if (alpha) any_alpha = true;
+                out[x] = (alpha << 24) | ((uint32_t)row[x * 4 + 2] << 16)
+                       | ((uint32_t)row[x * 4 + 1] << 8) | (uint32_t)row[x * 4];
+            }
+        }
+    }
+    ALICE_FREE(row);
+
+    if (bits == 32 && (opaque_only || (!has_alpha_mask && !any_alpha))) {
+        size_t index, count = (size_t)width * (size_t)height;
+        for (index = 0; index < count; ++index) {
+            surface->pixels[index] |= 0xFF000000u;
+        }
+    }
+    return surface;
+}
+
+alice_surface *alice_load_bmp(const char *path) {
+    alice_surface *surface;
+    FILE *file;
+
+    if (!path)
+        return NULL;
+    file = alice_fopen_read(path);
+    if (!file)
+        return NULL;
+
+    surface = alice_read_bmp(file);
+    fclose(file);
+    return surface;
+}
+
 ////////////////////////////////////////////////////////////
 //   Colour   //////////////////////////////////////
 ////////////////////////////////////////////
 
 static float alice_clamp01(float value) {
-    if (!(value > 0.0f))    // also catches NaN
+    if (!(value > 0.0f)) // also catches NaN
         return 0.0f;
     if (value > 1.0f)
         return 1.0f;
