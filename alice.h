@@ -2644,7 +2644,7 @@ bool alice_set_cursor(alice_window *window, alice_cursor cursor) {
     window->cursor_shape = (int)cursor;
     if (!alice_backend_apply_cursor(window)) {
         window->cursor_shape = previous;
-        return true;
+        return false;
     }
     return true;
 }
