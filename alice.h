@@ -200,6 +200,8 @@ ALICE_API bool alice_set_cursor_visible(alice_window *window, bool visible);
 
 // pick the shape of the mouse cursor over the window (shown while it is visible)
 ALICE_API bool alice_set_cursor(alice_window *window, alice_cursor cursor);
+ALICE_API bool alice_set_mouse(alice_window *window, int x, int y);
+ALICE_API bool alice_center_mouse(alice_window *window);
 
 //// event
 
@@ -517,6 +519,7 @@ static bool alice_backend_set_title(alice_window *window, const char *title);
 static bool alice_backend_set_fullscreen(alice_window *window, bool fullscreen);
 
 static bool alice_backend_apply_cursor(alice_window *window);
+static bool alice_backend_warp_mouse(alice_window *window, int pixel_x, int pixel_y);
 
 static void alice_update_viewport(alice_window *window);
 
@@ -827,6 +830,7 @@ static bool alice_backend_resize(alice_window *window)   { (void)window; return 
 static bool alice_backend_set_title(alice_window *window, const char *title) { (void)window; (void)title; return true; }
 static bool alice_backend_set_fullscreen(alice_window *window, bool fullscreen) { (void)window; (void)fullscreen; return true; }
 static bool alice_backend_apply_cursor(alice_window *window) { (void)window; return true; }
+static bool alice_backend_warp_mouse(alice_window *window, int pixel_x, int pixel_y) { (void)window; (void)pixel_x; (void)pixel_y; return true; }
 
 #elif defined(ALICE_BACKEND_WIN32)
 
@@ -1364,6 +1368,17 @@ static bool alice_backend_apply_cursor(alice_window *window) {
     &&  PtInRect(&client, point)
     )   alice_win_set_cursor(window);
     return true;
+}
+
+static bool alice_backend_warp_mouse(alice_window *window, int pixel_x, int pixel_y) {
+    POINT point;
+
+    if (!window->hwnd || GetForegroundWindow() != window->hwnd)
+        return false;
+
+    point.x = pixel_x;
+    point.y = pixel_y;
+    return ClientToScreen(window->hwnd, &point) && SetCursorPos(point.x, point.y);
 }
 
 #elif defined(ALICE_BACKEND_X11)
@@ -2259,6 +2274,31 @@ static bool alice_backend_apply_cursor(alice_window *window) {
     return true;
 }
 
+static bool alice_backend_warp_mouse(alice_window *window, int pixel_x, int pixel_y) {
+    Window focus, root_return, child_return;
+    int revert, root_x, root_y, window_x, window_y;
+    unsigned int mask;
+
+    if (!window->display || !window->window)
+        return false;
+
+    XGetInputFocus(window->display, &focus, &revert);
+    if (focus != window->window) {
+        if (focus != PointerRoot
+        ||  !XQueryPointer(
+                window->display, window->window, &root_return, &child_return,
+                &root_x, &root_y, &window_x, &window_y, &mask
+            )
+        ||  window_x < 0 || window_y < 0
+        ||  window_x >= window->client_width || window_y >= window->client_height
+        )   return false;
+    }
+
+    XWarpPointer(window->display, None, window->window, 0, 0, 0, 0, pixel_x, pixel_y);
+    XFlush(window->display);
+    return true;
+}
+
 static bool alice_backend_resize(alice_window *window) {
     int *columns;
     int x;
@@ -2432,6 +2472,13 @@ static bool alice_backend_apply_cursor(alice_window *window) {
     }
     SDL_SetCursor(*slot);
     SDL_ShowCursor(SDL_ENABLE);
+    return true;
+}
+
+static bool alice_backend_warp_mouse(alice_window *window, int pixel_x, int pixel_y) {
+    if (!window->window || !(SDL_GetWindowFlags(window->window) & SDL_WINDOW_INPUT_FOCUS))
+        return false;
+    SDL_WarpMouseInWindow(window->window, pixel_x, pixel_y);
     return true;
 }
 
@@ -2633,6 +2680,57 @@ bool alice_set_cursor_visible(alice_window *window, bool visible) {
         return false;
     }
     return true;
+}
+
+static int alice_from_framebuffer(int value, int framebuffer_size, int client_size) {
+    int64_t pixel;
+
+    if (framebuffer_size <= 0 || client_size <= 0)
+        return 0;
+
+    pixel = ((int64_t)value * 2 + 1) * client_size / ((int64_t)framebuffer_size * 2);
+
+    while (pixel > 0
+    &&     alice_to_framebuffer((int)pixel, framebuffer_size, client_size) > value
+    )      --pixel;
+    while (pixel < client_size - 1
+    &&     alice_to_framebuffer((int)pixel, framebuffer_size, client_size) < value
+    )      ++pixel;
+    return (int)pixel;
+}
+
+bool alice_set_mouse(alice_window *window, int x, int y) {
+    int pixel_x, pixel_y;
+
+    if (!window)
+        return false;
+
+    if (x < 0) {
+        x = 0;
+    } else if (x >= window->surface.width) {
+        x = window->surface.width - 1;
+    }
+
+    if (y < 0) {
+        y = 0;
+    } else if (y >= window->surface.height) {
+        y = window->surface.height - 1;
+    }
+
+    pixel_x = window->view_x + alice_from_framebuffer(x, window->surface.width,  window->view_w);
+    pixel_y = window->view_y + alice_from_framebuffer(y, window->surface.height, window->view_h);
+    if (!alice_backend_warp_mouse(window, pixel_x, pixel_y))
+        return false;
+
+    window->mouse_x = x;
+    window->mouse_y = y;
+    return true;
+}
+
+bool alice_center_mouse(alice_window *window) {
+    if (!window)
+        return false;
+    return alice_set_mouse(window, window->surface.width / 2, window->surface.height / 2);
 }
 
 bool alice_set_cursor(alice_window *window, alice_cursor cursor) {
