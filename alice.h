@@ -76,7 +76,8 @@ typedef struct alice_config {
     int scale;              // initial window size multiplier (of the framebuffer's size)
     bool resizable;
     bool stretch;           // fill the whole window with a non-integer stretch
-    bool fit_window;
+    bool fit_window;        // keep the framebuffer sized to the window (window size / scale)
+    bool fullscreen;        // start in fullscreen
 } alice_config;
 
 typedef struct alice_surface {
@@ -170,12 +171,35 @@ typedef struct alice_event {
     const char *path; // UTF-8 path string, dnd dropped file
 } alice_event;
 
+typedef enum alice_cursor {
+    ALICE_CURSOR_ARROW = 0,
+    ALICE_CURSOR_IBEAM,
+    ALICE_CURSOR_CROSSHAIR,
+    ALICE_CURSOR_HAND,
+    ALICE_CURSOR_WAIT,
+    ALICE_CURSOR_MOVE,
+    ALICE_CURSOR_COUNT
+} alice_cursor;
+
 
 //// window
 
 // create and show a window. returns NULL upon failure
 ALICE_API alice_window *alice_create(const alice_config *config);
 ALICE_API void alice_destroy(alice_window *window);
+
+// change the window title (UTF-8)
+ALICE_API bool alice_set_title(alice_window *window, const char *title);
+ALICE_API bool alice_set_fullscreen(alice_window *window, bool fullscreen);
+ALICE_API bool alice_is_fullscreen(const alice_window *window);
+
+//// cursor
+
+// hide or show the mouse cursor while it is over the window
+ALICE_API bool alice_set_cursor_visible(alice_window *window, bool visible);
+
+// pick the shape of the mouse cursor over the window (shown while it is visible)
+ALICE_API bool alice_set_cursor(alice_window *window, alice_cursor cursor);
 
 //// event
 
@@ -374,6 +398,7 @@ ALICE_API double alice_frame_wait(alice_frame_timer *timer, double fps);
     #include <X11/XKBlib.h>
     #include <X11/Xutil.h>
     #include <X11/Xatom.h>
+    #include <X11/cursorfont.h>
     #include <X11/keysym.h>
     #if defined(ALICE_X11_SHM)
         #include <X11/extensions/XShm.h>
@@ -402,6 +427,9 @@ struct alice_window {
     bool            resizable;
     bool            stretch;
     bool            fit_window;
+    bool            fullscreen;
+    bool            cursor_hidden;
+    int             cursor_shape;
 
     alice_surface   surface;
 
@@ -434,6 +462,8 @@ struct alice_window {
     int             map_source_width; // surface width column_map was built for
     bool            borders_dirty;
     int             wheel_remainder;
+    LONG_PTR        saved_style;
+    WINDOWPLACEMENT saved_placement;
 #elif defined(ALICE_BACKEND_X11)
     Display        *display;
     int             screen;
@@ -457,6 +487,11 @@ struct alice_window {
     bool            fast_format;
     unsigned long   channel_mask[3];
     int             channel_shift[3];
+
+    Atom            net_wm_state, net_wm_fullscreen, net_wm_name, net_wm_icon_name, utf8_string;
+    int             windowed_width, windowed_height;
+    Cursor          cursors[ALICE_CURSOR_COUNT];
+    Cursor          blank_cursor;
 #if defined(ALICE_X11_SHM)
     XShmSegmentInfo shm;
     bool            use_shm;
@@ -468,6 +503,7 @@ struct alice_window {
     SDL_Texture    *texture;
     uint32_t        window_id;
     bool            video_initialised;
+    SDL_Cursor     *cursors[ALICE_CURSOR_COUNT];
 #endif
 };
 
@@ -476,6 +512,11 @@ static void alice_backend_destroy(alice_window *window);
 static void alice_backend_pump(alice_window *window);
 static void alice_backend_present(alice_window *window);
 static bool alice_backend_resize(alice_window *window);
+
+static bool alice_backend_set_title(alice_window *window, const char *title);
+static bool alice_backend_set_fullscreen(alice_window *window, bool fullscreen);
+
+static bool alice_backend_apply_cursor(alice_window *window);
 
 static void alice_update_viewport(alice_window *window);
 
@@ -783,6 +824,9 @@ static void alice_backend_destroy(alice_window *window)  { (void)window; }
 static void alice_backend_pump(alice_window *window)     { (void)window; }
 static void alice_backend_present(alice_window *window)  { (void)window; }
 static bool alice_backend_resize(alice_window *window)   { (void)window; return true; }
+static bool alice_backend_set_title(alice_window *window, const char *title) { (void)window; (void)title; return true; }
+static bool alice_backend_set_fullscreen(alice_window *window, bool fullscreen) { (void)window; (void)fullscreen; return true; }
+static bool alice_backend_apply_cursor(alice_window *window) { (void)window; return true; }
 
 #elif defined(ALICE_BACKEND_WIN32)
 
@@ -986,6 +1030,24 @@ static void alice_win_paint(alice_window *window) {
     GdiFlush();
 }
 
+#ifndef IDC_HAND
+    #define IDC_HAND MAKEINTRESOURCE(32649)
+#endif
+
+static void alice_win_set_cursor(const alice_window *window) {
+    LPCTSTR name;
+
+    switch (window->cursor_shape) {
+    case ALICE_CURSOR_IBEAM:     name = IDC_IBEAM;   break;
+    case ALICE_CURSOR_CROSSHAIR: name = IDC_CROSS;   break;
+    case ALICE_CURSOR_HAND:      name = IDC_HAND;    break;
+    case ALICE_CURSOR_WAIT:      name = IDC_WAIT;    break;
+    case ALICE_CURSOR_MOVE:      name = IDC_SIZEALL; break;
+    default:                     name = IDC_ARROW;   break;
+    }
+    SetCursor(window->cursor_hidden ? NULL : LoadCursor(NULL, name));
+}
+
 static LRESULT CALLBACK alice_win_proc(HWND hwnd, UINT msg, WPARAM message_word, LPARAM message_parameter) {
     alice_window *window = (alice_window *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
 
@@ -1121,6 +1183,13 @@ static LRESULT CALLBACK alice_win_proc(HWND hwnd, UINT msg, WPARAM message_word,
         return 0;
     }
 
+    case WM_SETCURSOR:
+        if (LOWORD(message_parameter) == HTCLIENT) {
+            alice_win_set_cursor(window);
+            return TRUE;
+        }
+        break;
+
     case WM_ERASEBKGND:
         return 1;
 
@@ -1225,6 +1294,76 @@ static void alice_backend_present(alice_window *window) {
 
 static bool alice_backend_resize(alice_window *window) {
     return alice_win_sync_dib(window);
+}
+
+static bool alice_backend_set_title(alice_window *window, const char *title) {
+    wchar_t *wide;
+    bool ok;
+    int count;
+
+    if (!window->hwnd)
+        return false;
+    count = MultiByteToWideChar(CP_UTF8, 0, title, -1, NULL, 0);
+    if (count <= 0)
+        return false;
+    wide = (wchar_t *)ALICE_MALLOC((size_t)count * sizeof(wchar_t));
+    if (!wide)
+        return false;
+    ok = MultiByteToWideChar(CP_UTF8, 0, title, -1, wide, count) > 0
+      && SetWindowTextW(window->hwnd, wide) != 0;
+    ALICE_FREE(wide);
+    return ok;
+}
+
+static bool alice_backend_set_fullscreen(alice_window *window, bool fullscreen) {
+    HWND hwnd = window->hwnd;
+
+    if (!hwnd)
+        return false;
+
+    if (fullscreen) {
+        MONITORINFO info;
+        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+
+        memset(&info, 0, sizeof(info));
+        info.cbSize = sizeof(info);
+        window->saved_placement.length = sizeof(window->saved_placement);
+        if (!GetWindowPlacement(hwnd, &window->saved_placement)
+        ||  !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &info)
+        )   return false;
+
+        window->saved_style = style;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~(LONG_PTR)WS_OVERLAPPEDWINDOW);
+        SetWindowPos(
+            hwnd, HWND_TOP,
+            info.rcMonitor.left, info.rcMonitor.top,
+            info.rcMonitor.right - info.rcMonitor.left,
+            info.rcMonitor.bottom - info.rcMonitor.top,
+            SWP_NOOWNERZORDER | SWP_FRAMECHANGED
+        );
+    } else {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, window->saved_style);
+        SetWindowPlacement(hwnd, &window->saved_placement);
+        SetWindowPos(
+            hwnd, NULL, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED
+        );
+    }
+    return true;
+}
+
+static bool alice_backend_apply_cursor(alice_window *window) {
+    POINT point;
+    RECT client;
+
+    if (window->hwnd
+    &&  GetCursorPos(&point)
+    &&  WindowFromPoint(point) == window->hwnd
+    &&  ScreenToClient(window->hwnd, &point)
+    &&  GetClientRect(window->hwnd, &client)
+    &&  PtInRect(&client, point)
+    )   alice_win_set_cursor(window);
+    return true;
 }
 
 #elif defined(ALICE_BACKEND_X11)
@@ -1759,9 +1898,79 @@ static void alice_x_present(alice_window *window) {
     XFlush(window->display);
 }
 
+static void alice_x_apply_title(alice_window *window, const char *title) {
+    int length = (int)strlen(title);
+
+    Xutf8SetWMProperties(window->display, window->window, title, title, NULL, 0, NULL, NULL, NULL);
+    XChangeProperty(
+        window->display, window->window, window->net_wm_name, window->utf8_string, 8,
+        PropModeReplace, (const unsigned char *)title, length
+    );
+    XChangeProperty(
+        window->display, window->window, window->net_wm_icon_name, window->utf8_string, 8,
+        PropModeReplace, (const unsigned char *)title, length
+    );
+}
+
+static void alice_x_set_fixed_size(alice_window *window, int width, int height) {
+    XSizeHints hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.flags = PMinSize | PMaxSize;
+    hints.min_width = hints.max_width = width;
+    hints.min_height = hints.max_height = height;
+    XSetWMNormalHints(window->display, window->window, &hints);
+}
+
+static void alice_x_set_free_size(alice_window *window) {
+    XSizeHints hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.flags = PMinSize | PMaxSize;
+    hints.min_width = hints.min_height = 1;
+    hints.max_width = hints.max_height = ALICE_MAX_WINDOW_SIDE;
+    XSetWMNormalHints(window->display, window->window, &hints);
+}
+
+static void alice_x_sync_fullscreen(alice_window *window) {
+    Atom actual_type;
+    int actual_format;
+    unsigned long count = 0, remaining, index;
+    unsigned char *data = NULL;
+    bool fullscreen = false;
+
+    if (XGetWindowProperty(
+            window->display, window->window, window->net_wm_state, 0, 1024, False, XA_ATOM,
+            &actual_type, &actual_format, &count, &remaining, &data
+        ) == Success && data && actual_type == XA_ATOM && actual_format == 32
+    ) {
+        const long *atoms = (const long *)data;
+        for (index = 0; index < count; ++index) {
+            if ((Atom)atoms[index] == window->net_wm_fullscreen)
+                fullscreen = true;
+        }
+    }
+    if (data)
+        XFree(data);
+
+    if (fullscreen != window->fullscreen) {
+        window->fullscreen = fullscreen;
+        if (!fullscreen && !window->resizable && window->windowed_width > 0)
+            alice_x_set_fixed_size(window, window->windowed_width, window->windowed_height);
+    }
+}
+
 static void alice_backend_destroy(alice_window *window) {
     alice_x_free_image(window);
     if (window->display) {
+        int cursor_index;
+        for (cursor_index = 0; cursor_index < (int)ALICE_CURSOR_COUNT; ++cursor_index) {
+            if (window->cursors[cursor_index])
+                XFreeCursor(window->display, window->cursors[cursor_index]);
+            window->cursors[cursor_index] = 0;
+        }
+        
+        if (window->blank_cursor)
+            XFreeCursor(window->display, window->blank_cursor);
+        window->blank_cursor = 0;
         if (window->gc)
             XFreeGC(window->display, window->gc);
         if (window->window)
@@ -1785,7 +1994,8 @@ static bool alice_backend_create(alice_window *window, const alice_config *confi
     |   ButtonReleaseMask
     |   PointerMotionMask
     |   StructureNotifyMask
-    |   FocusChangeMask;
+    |   FocusChangeMask
+    |   PropertyChangeMask;
 
     window->display = XOpenDisplay(NULL);
     if (!window->display)
@@ -1800,7 +2010,12 @@ static bool alice_backend_create(alice_window *window, const alice_config *confi
     );
     if (!window->window) return false;
 
-    Xutf8SetWMProperties(window->display, window->window, title, title, NULL, 0, NULL, NULL, NULL);
+    window->net_wm_state      = XInternAtom(window->display, "_NET_WM_STATE", False);
+    window->net_wm_fullscreen = XInternAtom(window->display, "_NET_WM_STATE_FULLSCREEN", False);
+    window->net_wm_name       = XInternAtom(window->display, "_NET_WM_NAME", False);
+    window->net_wm_icon_name  = XInternAtom(window->display, "_NET_WM_ICON_NAME", False);
+    window->utf8_string       = XInternAtom(window->display, "UTF8_STRING", False);
+    alice_x_apply_title(window, title);
     XSelectInput(window->display, window->window, events);
 
     window->wm_protocols = XInternAtom(window->display, "WM_PROTOCOLS", False);
@@ -1827,14 +2042,10 @@ static bool alice_backend_create(alice_window *window, const alice_config *confi
         );
     }
 
-    if (!window->resizable) {
-        XSizeHints hints;
-        memset(&hints, 0, sizeof(hints));
-        hints.flags = PMinSize | PMaxSize;
-        hints.min_width = hints.max_width = (int)width;
-        hints.min_height = hints.max_height = (int)height;
-        XSetWMNormalHints(window->display, window->window, &hints);
-    }
+    window->windowed_width  = (int)width;
+    window->windowed_height = (int)height;
+    if (!window->resizable)
+        alice_x_set_fixed_size(window, (int)width, (int)height);
 
     window->detectable_repeat = XkbSetDetectableAutoRepeat(window->display, True, &supported) && supported;
 
@@ -1953,6 +2164,12 @@ static void alice_backend_pump(alice_window *window) {
             alice_release_all(window);
             break;
 
+        case PropertyNotify:
+            if (event_data.xproperty.window == window->window
+            &&  event_data.xproperty.atom == window->net_wm_state
+            )   alice_x_sync_fullscreen(window);
+            break;
+
         default:
             break;
         }
@@ -1961,6 +2178,85 @@ static void alice_backend_pump(alice_window *window) {
 
 static void alice_backend_present(alice_window *window) {
     alice_x_present(window);
+}
+
+static bool alice_backend_set_title(alice_window *window, const char *title) {
+    if (!window->display || !window->window)
+        return false;
+    alice_x_apply_title(window, title);
+    XFlush(window->display);
+    return true;
+}
+
+static bool alice_backend_set_fullscreen(alice_window *window, bool fullscreen) {
+    XEvent event;
+
+    if (!window->display || !window->window)
+        return false;
+
+    if (!window->resizable) {
+        if (fullscreen) {
+            window->windowed_width  = window->client_width;
+            window->windowed_height = window->client_height;
+            alice_x_set_free_size(window);
+        } else {
+            alice_x_set_fixed_size(window, window->windowed_width, window->windowed_height);
+        }
+    }
+
+    memset(&event, 0, sizeof(event));
+    event.xclient.type          = ClientMessage;
+    event.xclient.window        = window->window;
+    event.xclient.message_type  = window->net_wm_state;
+    event.xclient.format        = 32;
+    event.xclient.data.l[0]     = fullscreen ? 1 : 0;
+    event.xclient.data.l[1]     = (long)window->net_wm_fullscreen;
+    event.xclient.data.l[3]     = 1;
+    if (!XSendEvent(
+            window->display, RootWindow(window->display, window->screen), False,
+            SubstructureNotifyMask | SubstructureRedirectMask, &event
+    )) return false;
+
+    XFlush(window->display);
+    return true;
+}
+
+static bool alice_backend_apply_cursor(alice_window *window) {
+    static const unsigned shapes[ALICE_CURSOR_COUNT] = {
+        XC_left_ptr, XC_xterm, XC_crosshair, XC_hand2, XC_watch, XC_fleur
+    };
+    Cursor cursor;
+
+    if (!window->display || !window->window)
+        return true;
+
+    if (window->cursor_hidden) {
+        if (!window->blank_cursor) {
+            static const char empty[1] = { 0 };
+            XColor black;
+            Pixmap pixmap = XCreateBitmapFromData(window->display, window->window, empty, 1, 1);
+            if (!pixmap)
+                return false;
+            memset(&black, 0, sizeof(black));
+            window->blank_cursor = XCreatePixmapCursor(window->display, pixmap, pixmap, &black, &black, 0, 0);
+            XFreePixmap(window->display, pixmap);
+            if (!window->blank_cursor)
+                return false;
+        }
+        cursor = window->blank_cursor;
+    } else {
+        if (!window->cursors[window->cursor_shape]) {
+            window->cursors[window->cursor_shape]
+                = XCreateFontCursor(window->display, shapes[window->cursor_shape]);
+            if (!window->cursors[window->cursor_shape])
+                return false;
+        }
+        cursor = window->cursors[window->cursor_shape];
+    }
+
+    XDefineCursor(window->display, window->window, cursor);
+    XFlush(window->display);
+    return true;
 }
 
 static bool alice_backend_resize(alice_window *window) {
@@ -2028,6 +2324,16 @@ static int alice_sdl_key(SDL_Keycode key_symbol) {
 }
 
 static void alice_backend_destroy(alice_window *window) {
+    int cursor_index;
+    for (cursor_index = 0; cursor_index < (int)ALICE_CURSOR_COUNT; ++cursor_index) {
+        if (window->cursors[cursor_index])
+            SDL_FreeCursor(window->cursors[cursor_index]);
+        window->cursors[cursor_index] = NULL;
+    }
+    if (window->cursor_hidden && window->video_initialised) {
+        SDL_ShowCursor(SDL_ENABLE);
+        window->cursor_hidden = false;
+    }
     if (window->texture)
         SDL_DestroyTexture(window->texture);
     if (window->renderer)
@@ -2089,6 +2395,44 @@ static void alice_backend_present(alice_window *window) {
         SDL_RenderCopy(window->renderer, window->texture, NULL, &destination_pixels);
     }
     SDL_RenderPresent(window->renderer);
+}
+
+static bool alice_backend_set_title(alice_window *window, const char *title) {
+    if (!window->window)
+        return false;
+    SDL_SetWindowTitle(window->window, title);
+    return true;
+}
+
+static bool alice_backend_set_fullscreen(alice_window *window, bool fullscreen) {
+    if (!window->window)
+        return false;
+    return SDL_SetWindowFullscreen(window->window, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) == 0;
+}
+
+static bool alice_backend_apply_cursor(alice_window *window) {
+    static const SDL_SystemCursor shapes[ALICE_CURSOR_COUNT] = {
+        SDL_SYSTEM_CURSOR_ARROW, SDL_SYSTEM_CURSOR_IBEAM, SDL_SYSTEM_CURSOR_CROSSHAIR,
+        SDL_SYSTEM_CURSOR_HAND, SDL_SYSTEM_CURSOR_WAIT, SDL_SYSTEM_CURSOR_SIZEALL
+    };
+    SDL_Cursor **slot = &window->cursors[window->cursor_shape];
+
+    if (!window->window)
+        return true;
+
+    if (window->cursor_hidden) {
+        SDL_ShowCursor(SDL_DISABLE);
+        return true;
+    }
+
+    if (!*slot) {
+        *slot = SDL_CreateSystemCursor(shapes[window->cursor_shape]);
+        if (!*slot)
+            return false;
+    }
+    SDL_SetCursor(*slot);
+    SDL_ShowCursor(SDL_ENABLE);
+    return true;
 }
 
 static bool alice_backend_resize(alice_window *window) {
@@ -2236,6 +2580,8 @@ alice_window *alice_create(const alice_config *config) {
         ALICE_FREE(window);
         return NULL;
     }
+    if (config->fullscreen)
+        alice_set_fullscreen(window, true);
     return window;
 }
 
@@ -2252,6 +2598,55 @@ void alice_destroy(alice_window *window) {
 
 void alice_present(alice_window *window) {
     if (window) alice_backend_present(window);
+}
+
+bool alice_set_title(alice_window *window, const char *title) {
+    if (!window)
+        return false;
+    return alice_backend_set_title(window, title ? title : "Alice");
+}
+
+bool alice_set_fullscreen(alice_window *window, bool fullscreen) {
+    if (!window)
+        return false;
+    if (window->fullscreen == fullscreen)
+        return true;
+    if (!alice_backend_set_fullscreen(window, fullscreen))
+        return false;
+    window->fullscreen = fullscreen;
+    return true;
+}
+
+bool alice_is_fullscreen(const alice_window *window) {
+    return window && window->fullscreen;
+}
+
+bool alice_set_cursor_visible(alice_window *window, bool visible) {
+    bool previous;
+
+    if (!window)
+        return false;
+    previous = window->cursor_hidden;
+    window->cursor_hidden = !visible;
+    if (!alice_backend_apply_cursor(window)) {
+        window->cursor_hidden = previous;
+        return false;
+    }
+    return true;
+}
+
+bool alice_set_cursor(alice_window *window, alice_cursor cursor) {
+    int previous;
+
+    if (!window || (int)cursor < 0 || (int)cursor >= (int)ALICE_CURSOR_COUNT)
+        return false;
+    previous = window->cursor_shape;
+    window->cursor_shape = (int)cursor;
+    if (!alice_backend_apply_cursor(window)) {
+        window->cursor_shape = previous;
+        return true;
+    }
+    return true;
 }
 
 ////////////////////////////////////////////////////////////
@@ -2499,42 +2894,6 @@ void alice_draw_point(alice_surface *surface, int x, int y, uint32_t color) {
     alice_put_pixel(surface, (size_t)y * (size_t)surface->width + (size_t)x, color);
 }
 
-// Cohen-Sutherland outcode
-// returns which side(s) of the surface the point is on
-static int alice_region(const alice_surface *surface, int x, int y) {
-    return  (x < 0 ? 1 : 0) | (x >= surface->width  ? 2 : 0)
-        |   (y < 0 ? 4 : 0) | (y >= surface->height ? 8 : 0);
-}
-
-static void alice_line_steps(uint64_t scale_factor, uint64_t array, uint64_t button, uint64_t *xs, uint64_t *ys) {
-    uint64_t major = array >= button ? array : button;
-    uint64_t minor = array >= button ? button : array;
-    uint64_t time = scale_factor * minor;
-    uint64_t m = time / major + ((time % major) * 2 >= major ? 1u : 0u);
-
-    if (array >= button) {
-        *xs = scale_factor;
-        *ys = m;
-    } else {
-        *xs = m;
-        *ys = scale_factor;
-    }
-}
-
-static bool alice_line_before(
-    const alice_surface *surface, int start_x, int start_y, int source_x, int source_y,
-    uint64_t scale_factor, uint64_t array, uint64_t button
-) {
-    uint64_t xs, ys;
-    int64_t x, y;
-
-    alice_line_steps(scale_factor, array, button, &xs, &ys);
-    x = (int64_t)start_x + source_x * (int64_t)xs;
-    y = (int64_t)start_y + source_y * (int64_t)ys;
-    return (source_x > 0 ? x < 0 : x >= surface->width)
-        || (source_y > 0 ? y < 0 : y >= surface->height);
-}
-
 static unsigned alice_line_outcode(const alice_surface *surface, double x, double y) {
     unsigned code = 0;
     if (x < 0.0) code |= 1u;
@@ -2729,31 +3088,6 @@ void alice_draw_rect_outline(alice_surface *surface, int x, int y, int width, in
         alice_span(surface, left, left, row, color);
         alice_span(surface, right, right, row, color);
     }
-}
-
-static uint64_t alice_isqrt(uint64_t value) {
-    uint64_t root = 0, bit = (uint64_t)1 << 62;
-
-    while (bit > value)
-        bit >>= 2;
-    while (bit) {
-        if (value >= root + bit) {
-            value -= root + bit;
-            root = (root >> 1) + bit;
-        } else {
-            root >>= 1;
-        }
-        bit >>= 2;
-    }
-    return root;
-}
-
-static int64_t alice_circle_reach(int64_t radius, int64_t dy) {
-    if (dy < 0)
-        dy = -dy;
-    if (dy > radius)
-        return -1;
-    return (int64_t)alice_isqrt((uint64_t)(radius * radius - dy * dy));
 }
 
 static void alice_circle_point(alice_surface *surface, int64_t x, int64_t y, uint32_t color) {
